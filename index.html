@@ -1914,10 +1914,6 @@
             return window.location.protocol === 'file:';
         }
 
-        function isHttpsPage() {
-            return window.location.protocol === 'https:';
-        }
-
         function getCurrentPageLabel() {
             if (isFileOrigin()) return window.location.href;
             return `${window.location.origin}${window.location.pathname}`;
@@ -1945,12 +1941,6 @@
             return parsed.origin !== window.location.origin;
         }
 
-        function isMixedContentRisk(apiUrl) {
-            const parsed = getParsedApiUrl(apiUrl);
-            if (!parsed) return false;
-            return isHttpsPage() && parsed.protocol === 'http:';
-        }
-
         function getFriendlyFetchErrorMessage(error, apiUrl) {
             const rawMessage = error?.message || String(error || 'Unknown error');
             const normalizedMessage = rawMessage.toLowerCase();
@@ -1964,12 +1954,6 @@
             }
 
             if (rawMessage.includes('Failed to fetch')) {
-                if (isMixedContentRisk(apiUrl)) {
-                    return currentLang === 'zh'
-                        ? `当前页面地址是 ${pageLabel}，而接口是 ${target}。HTTPS 页面直连 HTTP 接口会被浏览器当作 mixed content 拦截；像部署在 GitHub Pages 上的页面访问 http://192.168.x.x 这类局域网接口时也会这样。请把接口改成 HTTPS，或改用仓库里的 Python 后端版/你自己的代理。`
-                        : `This page is loaded from ${pageLabel}, but the API is ${target}. Browsers block HTTPS pages from directly calling HTTP APIs as mixed content; this also applies to pages hosted on GitHub Pages calling LAN endpoints like http://192.168.x.x. Use HTTPS for the API, or switch to the project's Python backend / your own proxy.`;
-                }
-
                 if (isFileOrigin()) {
                     return currentLang === 'zh'
                         ? `浏览器拦截了对 ${target} 的直接请求：当前页面是通过 file:// 打开的，来源会被视为 null。请改为通过本地 HTTP 服务访问本页面，或使用仓库里的 Python 后端版；如果目标 API 没有返回 Access-Control-Allow-Origin，仍然需要后端代理。`
@@ -1998,7 +1982,7 @@
             const shouldShowWarning = apiType === 'openai'
                 && parsedApiUrl
                 && /^https?:$/.test(parsedApiUrl.protocol)
-                && (isFileOrigin() || isMixedContentRisk(apiUrlValue) || isCrossOriginRequest(apiUrlValue));
+                && (isFileOrigin() || isCrossOriginRequest(apiUrlValue));
 
             if (!shouldShowWarning) {
                 browserEnvWarning.style.display = 'none';
@@ -2009,13 +1993,7 @@
             const target = escapeHtml(getApiTargetLabel(apiUrlValue));
             const pageLabel = escapeHtml(getCurrentPageLabel());
 
-            if (isMixedContentRisk(apiUrlValue)) {
-                if (currentLang === 'zh') {
-                    browserEnvWarning.innerHTML = `<strong>HTTPS 页面直连 HTTP 接口提醒</strong>当前页面地址是 <code>${pageLabel}</code>。像 <code>${target}</code> 这样的 HTTP 接口，如果从 GitHub Pages 或其他 HTTPS 页面直接访问，会被浏览器当作 mixed content 拦截；访问 <code>http://192.168.x.x</code> 这类局域网接口时尤其常见。请把接口改成 HTTPS，或改用 <code>python/启动测速工具.bat</code> / <code>python/llm_test_backend.py</code> 这套后端版。`;
-                } else {
-                    browserEnvWarning.innerHTML = `<strong>HTTPS page to HTTP API warning</strong>This page is loaded from <code>${pageLabel}</code>. HTTP endpoints like <code>${target}</code> will be blocked as mixed content when called directly from GitHub Pages or any other HTTPS site, which commonly happens with LAN URLs such as <code>http://192.168.x.x</code>. Use HTTPS for the API, or switch to <code>python/Start_LLM_Speed_Test.bat</code> / <code>python/llm_test_backend.py</code>.`;
-                }
-            } else if (isFileOrigin()) {
+            if (isFileOrigin()) {
                 if (currentLang === 'zh') {
                     browserEnvWarning.innerHTML = `<strong>浏览器直连提醒</strong>当前页面是通过 <code>file://</code> 打开的，浏览器会把来源视为 <code>null</code>。像 <code>${target}</code> 这类 OpenAI 兼容接口如果没有返回 <code>Access-Control-Allow-Origin</code>，模型列表和测速请求都会被 CORS 拦截。可直接双击 <code>python/启动测速工具.bat</code>，或先运行 <code>python/llm_test_backend.py</code> 再打开 <code>python/LLM_Speed_Test_v3_Python_Backend.html</code>。`;
                 } else {
