@@ -120,9 +120,10 @@
             line-height: 1;
             transition: all 0.2s ease;
             white-space: nowrap;
+            position: relative;
         }
 
-        .lang-toggle-btn:hover:not(:disabled) {
+        .lang-toggle-btn:hover {
             color: #fff;
             border-color: rgba(97, 175, 239, 0.4);
         }
@@ -137,6 +138,61 @@
         .lang-toggle-btn:disabled {
             cursor: wait;
             opacity: 0.72;
+        }
+
+        .lang-toggle-btn.busy {
+            opacity: 0.78;
+            cursor: progress;
+            padding-left: 30px;
+        }
+
+        .lang-toggle-btn.busy::before {
+            content: '';
+            position: absolute;
+            left: 11px;
+            top: 50%;
+            width: 10px;
+            height: 10px;
+            border: 2px solid currentColor;
+            border-right-color: transparent;
+            border-radius: 50%;
+            transform: translateY(-50%);
+            animation: lang-toggle-spin 0.75s linear infinite;
+        }
+
+        .lang-toggle-btn.busy::after {
+            content: '...';
+            display: inline-block;
+            width: 0;
+            margin-left: 2px;
+            font-size: 11px;
+            letter-spacing: 0.04em;
+            overflow: hidden;
+            vertical-align: bottom;
+            animation: lang-toggle-dots 1.1s steps(4, end) infinite;
+        }
+
+        @keyframes lang-toggle-spin {
+            to {
+                transform: translateY(-50%) rotate(360deg);
+            }
+        }
+
+        @keyframes lang-toggle-dots {
+            0%,
+            20% {
+                width: 0;
+            }
+            40% {
+                width: 0.38em;
+            }
+            60% {
+                width: 0.76em;
+            }
+            80%,
+            100% {
+                width: 1.14em;
+            }
         }
 
         .tab-btn {
@@ -1681,9 +1737,17 @@
         let mobileFiltersCollapsed = false;
         const PAGE_LANGUAGE = { ZH: 'zh-CN', EN: 'en' };
         const PAGE_LANGUAGE_STORAGE_KEY = 'llm_speedtest_page_language';
-        const TRANSLATE_SEPARATOR = '\n__LLM_SPEEDTEST_SPLIT__\n';
+        const TRANSLATION_CACHE_STORAGE_KEY = 'llm_speedtest_translation_cache_v1';
+        const TRANSLATION_CACHE_MAX_ITEMS = 2000;
+        const TRANSLATE_SEPARATOR_MARKER = '908271645029';
+        const TRANSLATE_SEPARATOR = `\n[[${TRANSLATE_SEPARATOR_MARKER}]]\n`;
         const TRANSLATABLE_ATTRS = ['title', 'placeholder', 'aria-label'];
-        const TRANSLATION_BATCH_MAX_ENCODED_LENGTH = 1600;
+        const PREFER_EDGE_NATIVE_TRANSLATOR = false;
+        const TRANSLATION_BATCH_MAX_ENCODED_LENGTH = 3200;
+        const MYMEMORY_MAX_QUERY_CHARS = 420;
+        const MYMEMORY_REQUEST_SPACING_MS = 1400;
+        const MYMEMORY_RETRY_DELAYS_MS = [3000, 6000, 12000];
+        const TRANSLATION_AUTO_RETRY_COOLDOWN_MS = 60000;
         const CHINESE_TEXT_RE = /[\u3400-\u9FFF\uF900-\uFAFF]/;
         const ORIGINAL_DOCUMENT_TITLE = document.title;
         const textNodeOriginalMap = new WeakMap();
@@ -1697,6 +1761,13 @@
         let translationGeneration = 0;
         let isApplyingTranslations = false;
         let translationProviderLabel = '';
+        let translationLastErrorMessage = '';
+        let translationCachePersistTimer = null;
+        let translationRetryCooldownUntil = 0;
+        let myMemoryNextRequestAt = 0;
+        let activeTranslationPromise = null;
+        let translationNeedsRerun = false;
+        let languageToggleBusy = false;
         let edgeTranslatorSession = null;
         let edgeTranslatorPromise = null;
 
@@ -1737,8 +1808,70 @@
             }
         }
 
+        function loadPersistedTranslationCache() {
+            try {
+                const raw = localStorage.getItem(TRANSLATION_CACHE_STORAGE_KEY);
+                if (!raw) return;
+
+                const parsed = JSON.parse(raw);
+                if (!Array.isArray(parsed)) return;
+
+                parsed.forEach((entry) => {
+                    if (!Array.isArray(entry) || entry.length < 2) return;
+                    const [sourceText, translatedText] = entry;
+                    if (typeof sourceText !== 'string' || typeof translatedText !== 'string') return;
+                    translationCache.set(sourceText, translatedText);
+                });
+            } catch (_) {
+                // Ignore invalid cache payloads.
+            }
+        }
+
+        function persistTranslationCacheNow() {
+            try {
+                const entries = Array.from(translationCache.entries()).slice(-TRANSLATION_CACHE_MAX_ITEMS);
+                localStorage.setItem(TRANSLATION_CACHE_STORAGE_KEY, JSON.stringify(entries));
+            } catch (_) {
+                // Ignore storage quota or privacy-mode failures.
+            }
+        }
+
+        function schedulePersistTranslationCache() {
+            if (translationCachePersistTimer) return;
+
+            translationCachePersistTimer = window.setTimeout(() => {
+                translationCachePersistTimer = null;
+                persistTranslationCacheNow();
+            }, 200);
+        }
+
+        function setTranslationCacheValue(sourceText, translatedText) {
+            if (typeof sourceText !== 'string' || !sourceText) return;
+
+            const normalizedTranslation = typeof translatedText === 'string' && translatedText
+                ? translatedText
+                : sourceText;
+
+            if (translationCache.has(sourceText)) {
+                translationCache.delete(sourceText);
+            }
+            translationCache.set(sourceText, normalizedTranslation);
+
+            while (translationCache.size > TRANSLATION_CACHE_MAX_ITEMS) {
+                const oldestKey = translationCache.keys().next().value;
+                if (oldestKey === undefined) break;
+                translationCache.delete(oldestKey);
+            }
+
+            schedulePersistTranslationCache();
+        }
+
         function containsChineseText(text) {
             return CHINESE_TEXT_RE.test(String(text || ''));
+        }
+
+        function canUseEdgeNativeTranslator() {
+            return window.location.protocol !== 'file:';
         }
 
         function splitTextPadding(text) {
@@ -1792,19 +1925,44 @@
             return state;
         }
 
-        function updateLanguageToggleState(isBusy = false) {
+        function getLanguageToggleTitle() {
+            if (languageToggleBusy) {
+                return translationProviderLabel
+                    ? `正在后台翻译页面，可继续操作。当前服务: ${translationProviderLabel}`
+                    : '正在后台翻译页面，可继续操作';
+            }
+
+            if (Date.now() < translationRetryCooldownUntil) {
+                return '公共翻译接口限流中，请稍后再试';
+            }
+
+            if (translationLastErrorMessage) {
+                return translationLastErrorMessage;
+            }
+
+            if (translationProviderLabel) {
+                return `当前翻译服务: ${translationProviderLabel}`;
+            }
+
+            return '切换页面语言';
+        }
+
+        function updateLanguageToggleState(isBusy = languageToggleBusy) {
             const zhBtn = document.getElementById('langToggleZh');
             const enBtn = document.getElementById('langToggleEn');
             if (!zhBtn || !enBtn) return;
 
+            languageToggleBusy = !!isBusy;
             zhBtn.classList.toggle('active', currentPageLanguage === PAGE_LANGUAGE.ZH);
             enBtn.classList.toggle('active', currentPageLanguage === PAGE_LANGUAGE.EN);
-            zhBtn.disabled = !!isBusy;
-            enBtn.disabled = !!isBusy;
+            zhBtn.disabled = false;
+            enBtn.disabled = false;
+            zhBtn.classList.toggle('busy', languageToggleBusy && currentPageLanguage === PAGE_LANGUAGE.ZH);
+            enBtn.classList.toggle('busy', languageToggleBusy && currentPageLanguage === PAGE_LANGUAGE.EN);
+            zhBtn.setAttribute('aria-busy', String(languageToggleBusy && currentPageLanguage === PAGE_LANGUAGE.ZH));
+            enBtn.setAttribute('aria-busy', String(languageToggleBusy && currentPageLanguage === PAGE_LANGUAGE.EN));
 
-            const title = translationProviderLabel
-                ? `当前翻译服务: ${translationProviderLabel}`
-                : '切换页面语言';
+            const title = getLanguageToggleTitle();
             zhBtn.title = title;
             enBtn.title = title;
         }
@@ -1842,6 +2000,7 @@
 
         function schedulePageTranslation() {
             if (currentPageLanguage !== PAGE_LANGUAGE.EN || translationScheduled) return;
+            if (Date.now() < translationRetryCooldownUntil) return;
 
             translationScheduled = true;
             window.setTimeout(() => {
@@ -1852,7 +2011,7 @@
             }, 150);
         }
 
-        async function switchPageLanguage(nextLanguage, options = {}) {
+        function switchPageLanguage(nextLanguage, options = {}) {
             const normalized = nextLanguage === PAGE_LANGUAGE.EN ? PAGE_LANGUAGE.EN : PAGE_LANGUAGE.ZH;
             currentPageLanguage = normalized;
             document.documentElement.lang = normalized;
@@ -1863,24 +2022,27 @@
 
             translationGeneration += 1;
             const generation = translationGeneration;
-            updateLanguageToggleState(true);
+            translationLastErrorMessage = '';
 
             if (normalized === PAGE_LANGUAGE.ZH) {
+                translationNeedsRerun = false;
                 restoreOriginalPageText(document.body);
                 document.title = ORIGINAL_DOCUMENT_TITLE;
                 updateLanguageToggleState(false);
                 return;
             }
 
-            try {
-                await translateCurrentPage(generation);
-            } catch (error) {
+            updateLanguageToggleState(true);
+            translateCurrentPage(generation).catch((error) => {
                 console.error('Page translation failed:', error);
-            } finally {
+                if (!canUseEdgeNativeTranslator() && options.showFailureAlert !== false) {
+                    console.warn('当前通过 file:// 打开页面时，公共翻译接口无法稳定一次性处理整页内容。请运行 Start_Leaderboard_Localhost.bat，再用 Edge 打开 localhost 版本后切换 English。');
+                }
+            }).finally(() => {
                 if (generation === translationGeneration) {
                     updateLanguageToggleState(false);
                 }
-            }
+            });
         }
 
         function restoreOriginalPageText(root = document.body) {
@@ -1905,6 +2067,39 @@
                             translatedAttrs?.delete(attr);
                         });
                     });
+                }
+            } finally {
+                isApplyingTranslations = false;
+            }
+        }
+
+        function buildTranslationTaskGroups(tasks) {
+            const groups = new Map();
+
+            tasks.forEach((task) => {
+                if (!groups.has(task.sourceText)) {
+                    groups.set(task.sourceText, []);
+                }
+                groups.get(task.sourceText).push(task.apply);
+            });
+
+            return groups;
+        }
+
+        function applyTranslatedTaskGroups(taskGroups, translatedMap) {
+            if (!(translatedMap instanceof Map) || translatedMap.size === 0) return;
+
+            isApplyingTranslations = true;
+            try {
+                translatedMap.forEach((translatedText, sourceText) => {
+                    const handlers = taskGroups.get(sourceText);
+                    if (handlers) {
+                        handlers.forEach((applyTranslation) => applyTranslation(translatedText));
+                    }
+                });
+
+                if (translatedMap.has(ORIGINAL_DOCUMENT_TITLE)) {
+                    document.title = translatedMap.get(ORIGINAL_DOCUMENT_TITLE) || ORIGINAL_DOCUMENT_TITLE;
                 }
             } finally {
                 isApplyingTranslations = false;
@@ -2015,7 +2210,41 @@
         async function translateCurrentPage(generation = translationGeneration) {
             if (currentPageLanguage !== PAGE_LANGUAGE.EN) return;
 
+            updateLanguageToggleState(true);
+            if (activeTranslationPromise) {
+                translationNeedsRerun = true;
+                return activeTranslationPromise;
+            }
+
+            activeTranslationPromise = (async () => {
+                try {
+                    let nextGeneration = generation;
+
+                    while (currentPageLanguage === PAGE_LANGUAGE.EN) {
+                        const requestGeneration = nextGeneration;
+                        translationNeedsRerun = false;
+                        await translateCurrentPageCore(requestGeneration);
+
+                        if (currentPageLanguage !== PAGE_LANGUAGE.EN) break;
+                        if (!translationNeedsRerun) break;
+                        if (Date.now() < translationRetryCooldownUntil) break;
+
+                        nextGeneration = translationGeneration;
+                    }
+                } finally {
+                    activeTranslationPromise = null;
+                    updateLanguageToggleState(false);
+                }
+            })();
+
+            return activeTranslationPromise;
+        }
+
+        async function translateCurrentPageCore(generation = translationGeneration) {
+            if (currentPageLanguage !== PAGE_LANGUAGE.EN) return;
+
             const tasks = collectTranslationTasks(document.body);
+            const taskGroups = buildTranslationTaskGroups(tasks);
             const uniqueTexts = Array.from(new Set(tasks.map(task => task.sourceText)));
             if (containsChineseText(ORIGINAL_DOCUMENT_TITLE)) {
                 uniqueTexts.push(ORIGINAL_DOCUMENT_TITLE);
@@ -2023,23 +2252,46 @@
 
             const dedupedTexts = Array.from(new Set(uniqueTexts));
             if (!dedupedTexts.length) {
+                translationLastErrorMessage = '';
                 document.title = ORIGINAL_DOCUMENT_TITLE;
                 return;
             }
 
-            const translatedList = await translateTextArray(dedupedTexts, generation);
-            if (generation !== translationGeneration || currentPageLanguage !== PAGE_LANGUAGE.EN) return;
+            const cachedMap = new Map();
+            dedupedTexts.forEach((text) => {
+                if (translationCache.has(text)) {
+                    cachedMap.set(text, translationCache.get(text) || text);
+                }
+            });
 
-            const translatedMap = new Map(dedupedTexts.map((text, index) => [text, translatedList[index] || text]));
+            if (cachedMap.size) {
+                applyTranslatedTaskGroups(taskGroups, cachedMap);
+            }
 
-            isApplyingTranslations = true;
-            try {
-                tasks.forEach((task) => {
-                    task.apply(translatedMap.get(task.sourceText) || task.sourceText);
+            const missingTexts = dedupedTexts.filter((text) => containsChineseText(text) && !cachedMap.has(text));
+            if (!missingTexts.length) {
+                translationLastErrorMessage = '';
+                if (!cachedMap.has(ORIGINAL_DOCUMENT_TITLE)) {
+                    document.title = ORIGINAL_DOCUMENT_TITLE;
+                }
+                return;
+            }
+
+            const batches = [missingTexts];
+            for (const batch of batches) {
+                if (generation !== translationGeneration || currentPageLanguage !== PAGE_LANGUAGE.EN) return;
+
+                const translatedBatch = await translateBatchWithFallbacks(batch);
+                if (generation !== translationGeneration || currentPageLanguage !== PAGE_LANGUAGE.EN) return;
+
+                const translatedMap = new Map();
+                batch.forEach((sourceText, index) => {
+                    const translatedText = translatedBatch[index] || sourceText;
+                    setTranslationCacheValue(sourceText, translatedText);
+                    translatedMap.set(sourceText, translatedText);
                 });
-                document.title = translatedMap.get(ORIGINAL_DOCUMENT_TITLE) || ORIGINAL_DOCUMENT_TITLE;
-            } finally {
-                isApplyingTranslations = false;
+
+                applyTranslatedTaskGroups(taskGroups, translatedMap);
             }
         }
 
@@ -2070,14 +2322,115 @@
             return batches;
         }
 
+        function buildTranslationBatchesByCharLength(texts, maxChars) {
+            const batches = [];
+            let currentBatch = [];
+            let currentLength = 0;
+
+            texts.forEach((text) => {
+                const stringText = String(text || '');
+                const nextLength = currentBatch.length
+                    ? currentLength + TRANSLATE_SEPARATOR.length + stringText.length
+                    : stringText.length;
+
+                if (currentBatch.length && nextLength > maxChars) {
+                    batches.push(currentBatch);
+                    currentBatch = [stringText];
+                    currentLength = stringText.length;
+                    return;
+                }
+
+                currentBatch.push(stringText);
+                currentLength = nextLength;
+            });
+
+            if (currentBatch.length) {
+                batches.push(currentBatch);
+            }
+
+            return batches;
+        }
+
         function splitTranslatedBatch(text, expectedCount) {
             const exact = String(text || '').split(TRANSLATE_SEPARATOR);
             if (exact.length === expectedCount) return exact;
 
-            const normalized = String(text || '').split(/\n__\s*LLM_SPEEDTEST_SPLIT\s*__\n/gi);
+            const normalized = String(text || '').split(new RegExp(`\\r?\\n\\s*\\[\\[\\s*${TRANSLATE_SEPARATOR_MARKER}\\s*\\]\\]\\s*\\r?\\n`, 'i'));
             if (normalized.length === expectedCount) return normalized;
 
             throw new Error(`Translated batch size mismatch: expected ${expectedCount}, got ${exact.length}`);
+        }
+
+        function isMyMemoryQueryTooLong(text) {
+            return /QUERY LENGTH LIMIT EXCEEDED/i.test(String(text || ''));
+        }
+
+        function splitBatchInHalf(batch) {
+            const middle = Math.ceil(batch.length / 2);
+            return [batch.slice(0, middle), batch.slice(middle)];
+        }
+
+        function splitLongTextForTranslation(text, maxChars) {
+            const source = String(text || '');
+            if (source.length <= maxChars) return [source];
+
+            const chunks = [];
+            let remaining = source;
+
+            while (remaining.length > maxChars) {
+                let splitIndex = remaining.lastIndexOf('\n', maxChars);
+                if (splitIndex < maxChars * 0.4) {
+                    splitIndex = Math.max(
+                        remaining.lastIndexOf('。', maxChars),
+                        remaining.lastIndexOf('！', maxChars),
+                        remaining.lastIndexOf('？', maxChars),
+                        remaining.lastIndexOf('；', maxChars),
+                        remaining.lastIndexOf('，', maxChars),
+                        remaining.lastIndexOf(',', maxChars),
+                        remaining.lastIndexOf(' ', maxChars)
+                    );
+                }
+                if (splitIndex < maxChars * 0.4) {
+                    splitIndex = maxChars;
+                }
+
+                chunks.push(remaining.slice(0, splitIndex));
+                remaining = remaining.slice(splitIndex);
+            }
+
+            if (remaining) {
+                chunks.push(remaining);
+            }
+
+            return chunks;
+        }
+
+        function isTranslationRateLimitError(error) {
+            const message = String(error?.message || error || '');
+            return /HTTP 429|rate limit|too many requests/i.test(message);
+        }
+
+        function setTranslationRetryCooldown(ms = TRANSLATION_AUTO_RETRY_COOLDOWN_MS) {
+            translationRetryCooldownUntil = Date.now() + ms;
+            updateLanguageToggleState();
+        }
+
+        function clearTranslationRetryCooldown() {
+            translationRetryCooldownUntil = 0;
+        }
+
+        function waitForMs(ms) {
+            return new Promise((resolve) => window.setTimeout(resolve, ms));
+        }
+
+        function bindPublicTranslationProgressiveEvents() {
+            const onProgressiveTrigger = () => {
+                if (currentPageLanguage !== PAGE_LANGUAGE.EN) return;
+                schedulePageTranslation();
+            };
+
+            window.addEventListener('scroll', onProgressiveTrigger, { passive: true });
+            window.addEventListener('touchmove', onProgressiveTrigger, { passive: true });
         }
 
         async function translateTextArray(texts, generation = translationGeneration) {
@@ -2091,7 +2444,7 @@
                     if (generation !== translationGeneration || currentPageLanguage !== PAGE_LANGUAGE.EN) break;
                     const translatedBatch = await translateBatchWithFallbacks(batch);
                     batch.forEach((sourceText, index) => {
-                        translationCache.set(sourceText, translatedBatch[index] || sourceText);
+                        setTranslationCacheValue(sourceText, translatedBatch[index] || sourceText);
                     });
                 }
             }
@@ -2101,10 +2454,18 @@
 
         async function translateBatchWithFallbacks(batch) {
             const providers = [
-                { label: 'Microsoft Edge Translator', run: translateBatchWithEdgeNative },
                 { label: 'MyMemory Public API', run: translateBatchWithMyMemory },
                 { label: 'Google Translate Public API', run: translateBatchWithGoogle }
             ];
+
+            if (canUseEdgeNativeTranslator()) {
+                const edgeProvider = { label: 'Microsoft Edge Translator', run: translateBatchWithEdgeNative };
+                if (PREFER_EDGE_NATIVE_TRANSLATOR) {
+                    providers.unshift(edgeProvider);
+                } else {
+                    providers.push(edgeProvider);
+                }
+            }
 
             const errors = [];
 
@@ -2115,16 +2476,31 @@
                         throw new Error(`Invalid translation batch from ${provider.label}`);
                     }
                     translationProviderLabel = provider.label;
+                    translationLastErrorMessage = '';
+                    clearTranslationRetryCooldown();
                     return translated;
                 } catch (error) {
                     errors.push(`${provider.label}: ${error.message}`);
                 }
             }
 
-            throw new Error(errors.join(' | '));
+            let message = errors.join(' | ');
+            if (!canUseEdgeNativeTranslator()) {
+                message += ' | file:// 下公共翻译接口受限，建议改用 localhost 打开页面以启用 Edge 原生整页翻译';
+            }
+            const finalError = new Error(message);
+            translationLastErrorMessage = message;
+            if (isTranslationRateLimitError(finalError)) {
+                setTranslationRetryCooldown();
+            }
+            throw finalError;
         }
 
         async function getEdgeTranslatorSession() {
+            if (!canUseEdgeNativeTranslator()) {
+                throw new Error('Translator API disabled on file:// pages');
+            }
+
             if (edgeTranslatorSession) return edgeTranslatorSession;
             if (edgeTranslatorPromise) return edgeTranslatorPromise;
 
@@ -2176,27 +2552,62 @@
 
         async function translateBatchWithEdgeNative(batch) {
             const translator = await getEdgeTranslatorSession();
-            return runWithConcurrency(batch, 4, async (text) => {
-                const translated = await translator.translate(text);
-                return typeof translated === 'string' ? translated : String(translated || text);
-            });
+            const translated = await translator.translate(batch.join(TRANSLATE_SEPARATOR));
+            const translatedText = typeof translated === 'string' ? translated : String(translated || batch.join(TRANSLATE_SEPARATOR));
+            return splitTranslatedBatch(translatedText, batch.length);
         }
 
         async function translateBatchWithMyMemory(batch) {
-            return runWithConcurrency(batch, 3, async (text) => {
-                const url = new URL('https://api.mymemory.translated.net/get');
-                url.searchParams.set('q', text);
-                url.searchParams.set('langpair', 'zh-CN|en');
+            const joinedText = batch.join(TRANSLATE_SEPARATOR);
+            if (joinedText.length > MYMEMORY_MAX_QUERY_CHARS) {
+                throw new Error('Single-shot public translation exceeds MyMemory length limit');
+            }
+            return translateBatchWithMyMemoryRequest(batch);
+        }
 
-                const response = await fetch(url.toString());
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
+        async function translateBatchWithMyMemoryRequest(batch) {
+            const url = new URL('https://api.mymemory.translated.net/get');
+            url.searchParams.set('q', batch.join(TRANSLATE_SEPARATOR));
+            url.searchParams.set('langpair', 'zh-CN|en');
+
+            let lastError = null;
+
+            for (let attempt = 0; attempt <= MYMEMORY_RETRY_DELAYS_MS.length; attempt++) {
+                const now = Date.now();
+                const waitMs = Math.max(0, myMemoryNextRequestAt - now);
+                if (waitMs > 0) {
+                    await waitForMs(waitMs);
                 }
 
-                const payload = await response.json();
-                const translatedText = payload?.responseData?.translatedText;
-                return translatedText ? String(translatedText) : text;
-            });
+                myMemoryNextRequestAt = Date.now() + MYMEMORY_REQUEST_SPACING_MS;
+
+                const response = await fetch(url.toString());
+                if (response.ok) {
+                    const payload = await response.json();
+                    const translatedText = payload?.responseData?.translatedText
+                        ? String(payload.responseData.translatedText)
+                        : batch.join(TRANSLATE_SEPARATOR);
+
+                    if (isMyMemoryQueryTooLong(translatedText)) {
+                        throw new Error(translatedText);
+                    }
+
+                    if (batch.length === 1) {
+                        return [translatedText];
+                    }
+
+                    return splitTranslatedBatch(translatedText, batch.length);
+                }
+
+                lastError = new Error(`HTTP ${response.status}`);
+                if (response.status !== 429 || attempt >= MYMEMORY_RETRY_DELAYS_MS.length) {
+                    throw lastError;
+                }
+
+                await waitForMs(MYMEMORY_RETRY_DELAYS_MS[attempt]);
+            }
+
+            throw lastError || new Error('MyMemory translation failed');
         }
 
         async function translateBatchWithGoogle(batch) {
@@ -2761,6 +3172,7 @@
         window.onload = () => {
             currentPageLanguage = getStoredPageLanguage();
             document.documentElement.lang = currentPageLanguage;
+            loadPersistedTranslationCache();
             initializePageTranslation();
             updateLanguageToggleState(false);
 
