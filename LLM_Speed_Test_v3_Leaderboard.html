@@ -88,6 +88,57 @@
             max-width: 460px;
         }
 
+        .lang-toggle {
+            position: fixed;
+            top: 16px;
+            right: 16px;
+            z-index: 1400;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 4px;
+            border: 1px solid rgba(97, 175, 239, 0.32);
+            border-radius: 999px;
+            background: rgba(21, 25, 32, 0.88);
+            backdrop-filter: blur(10px);
+            box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+        }
+
+        .lang-toggle-btn {
+            appearance: none;
+            -webkit-appearance: none;
+            min-height: 32px;
+            padding: 0 12px;
+            border: 1px solid transparent;
+            border-radius: 999px;
+            background: transparent;
+            color: var(--text-main);
+            cursor: pointer;
+            font: inherit;
+            font-size: 12px;
+            font-weight: bold;
+            line-height: 1;
+            transition: all 0.2s ease;
+            white-space: nowrap;
+        }
+
+        .lang-toggle-btn:hover:not(:disabled) {
+            color: #fff;
+            border-color: rgba(97, 175, 239, 0.4);
+        }
+
+        .lang-toggle-btn.active {
+            color: #11161d;
+            border-color: rgba(97, 175, 239, 0.92);
+            background: linear-gradient(135deg, rgba(97, 175, 239, 0.98), rgba(152, 195, 121, 0.92));
+            box-shadow: 0 0 0 1px rgba(97, 175, 239, 0.18);
+        }
+
+        .lang-toggle-btn:disabled {
+            cursor: wait;
+            opacity: 0.72;
+        }
+
         .tab-btn {
             background: var(--bg-panel);
             color: var(--text-main);
@@ -275,6 +326,18 @@
         @media (max-width: 900px) {
             .charts-grid {
                 grid-template-columns: 1fr;
+            }
+
+            .lang-toggle {
+                top: 12px;
+                right: 12px;
+                padding: 3px;
+            }
+
+            .lang-toggle-btn {
+                min-height: 30px;
+                padding: 0 10px;
+                font-size: 11px;
             }
         }
 
@@ -1029,6 +1092,18 @@
             font-size: 10px;
         }
 
+        body.force-mobile-view .lang-toggle {
+            top: 12px;
+            right: 12px;
+            padding: 3px;
+        }
+
+        body.force-mobile-view .lang-toggle-btn {
+            min-height: 30px;
+            padding: 0 10px;
+            font-size: 11px;
+        }
+
         body.force-mobile-view .community-meta {
             font-size: 10px;
             line-height: 1.25;
@@ -1423,6 +1498,10 @@
 </head>
 
 <body>
+    <div class="lang-toggle" data-translate-skip="true" aria-label="Page language switch">
+        <button id="langToggleZh" class="lang-toggle-btn active" type="button" onclick="switchPageLanguage('zh-CN')">中文</button>
+        <button id="langToggleEn" class="lang-toggle-btn" type="button" onclick="switchPageLanguage('en')">English</button>
+    </div>
 
     <div class="container">
         <h1>LLM Speed Test 🏆 排行榜</h1>
@@ -1600,6 +1679,26 @@
         let forceDesktopView = !isLikelyMobileClient;
         let wasMobileViewport = manualMobileView;
         let mobileFiltersCollapsed = false;
+        const PAGE_LANGUAGE = { ZH: 'zh-CN', EN: 'en' };
+        const PAGE_LANGUAGE_STORAGE_KEY = 'llm_speedtest_page_language';
+        const TRANSLATE_SEPARATOR = '\n__LLM_SPEEDTEST_SPLIT__\n';
+        const TRANSLATABLE_ATTRS = ['title', 'placeholder', 'aria-label'];
+        const TRANSLATION_BATCH_MAX_ENCODED_LENGTH = 1600;
+        const CHINESE_TEXT_RE = /[\u3400-\u9FFF\uF900-\uFAFF]/;
+        const ORIGINAL_DOCUMENT_TITLE = document.title;
+        const textNodeOriginalMap = new WeakMap();
+        const translatedTextNodeSet = new WeakSet();
+        const elementAttributeOriginalMap = new WeakMap();
+        const translatedElementAttrsMap = new WeakMap();
+        const translationCache = new Map();
+        let currentPageLanguage = PAGE_LANGUAGE.ZH;
+        let translationObserver = null;
+        let translationScheduled = false;
+        let translationGeneration = 0;
+        let isApplyingTranslations = false;
+        let translationProviderLabel = '';
+        let edgeTranslatorSession = null;
+        let edgeTranslatorPromise = null;
 
         // Chart instances
         let charts = {
@@ -1620,6 +1719,511 @@
             const parsed = parseInt(raw, 10);
             if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MODEL_TAG_MIN_COUNT;
             return parsed;
+        }
+
+        function getStoredPageLanguage() {
+            try {
+                return localStorage.getItem(PAGE_LANGUAGE_STORAGE_KEY) === PAGE_LANGUAGE.EN ? PAGE_LANGUAGE.EN : PAGE_LANGUAGE.ZH;
+            } catch (_) {
+                return PAGE_LANGUAGE.ZH;
+            }
+        }
+
+        function persistPageLanguage() {
+            try {
+                localStorage.setItem(PAGE_LANGUAGE_STORAGE_KEY, currentPageLanguage);
+            } catch (_) {
+                // Ignore storage failures in privacy mode or restricted environments.
+            }
+        }
+
+        function containsChineseText(text) {
+            return CHINESE_TEXT_RE.test(String(text || ''));
+        }
+
+        function splitTextPadding(text) {
+            const raw = String(text || '');
+            const match = raw.match(/^(\s*)([\s\S]*?)(\s*)$/);
+            return {
+                leading: match ? match[1] : '',
+                core: match ? match[2] : raw,
+                trailing: match ? match[3] : ''
+            };
+        }
+
+        function shouldSkipElement(element) {
+            if (!(element instanceof Element)) return true;
+            const tagName = element.tagName;
+            if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'IFRAME', 'CANVAS', 'SVG', 'MATH'].includes(tagName)) return true;
+            return !!element.closest('[data-translate-skip="true"]');
+        }
+
+        function walkTextNodes(root, callback) {
+            if (!(root instanceof Node)) return;
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            let current = walker.nextNode();
+            while (current) {
+                callback(current);
+                current = walker.nextNode();
+            }
+        }
+
+        function walkElementNodes(root, callback) {
+            if (!(root instanceof Element)) return;
+            callback(root);
+            root.querySelectorAll('*').forEach(callback);
+        }
+
+        function getElementOriginalAttrs(element) {
+            let state = elementAttributeOriginalMap.get(element);
+            if (!state) {
+                state = {};
+                elementAttributeOriginalMap.set(element, state);
+            }
+            return state;
+        }
+
+        function getElementTranslatedAttrs(element) {
+            let state = translatedElementAttrsMap.get(element);
+            if (!state) {
+                state = new Set();
+                translatedElementAttrsMap.set(element, state);
+            }
+            return state;
+        }
+
+        function updateLanguageToggleState(isBusy = false) {
+            const zhBtn = document.getElementById('langToggleZh');
+            const enBtn = document.getElementById('langToggleEn');
+            if (!zhBtn || !enBtn) return;
+
+            zhBtn.classList.toggle('active', currentPageLanguage === PAGE_LANGUAGE.ZH);
+            enBtn.classList.toggle('active', currentPageLanguage === PAGE_LANGUAGE.EN);
+            zhBtn.disabled = !!isBusy;
+            enBtn.disabled = !!isBusy;
+
+            const title = translationProviderLabel
+                ? `当前翻译服务: ${translationProviderLabel}`
+                : '切换页面语言';
+            zhBtn.title = title;
+            enBtn.title = title;
+        }
+
+        function initializePageTranslation() {
+            if (translationObserver) return;
+
+            translationObserver = new MutationObserver((mutations) => {
+                if (currentPageLanguage !== PAGE_LANGUAGE.EN || isApplyingTranslations) return;
+
+                for (const mutation of mutations) {
+                    if (mutation.type === 'characterData') {
+                        schedulePageTranslation();
+                        return;
+                    }
+                    if (mutation.type === 'childList' && (mutation.addedNodes.length || mutation.removedNodes.length)) {
+                        schedulePageTranslation();
+                        return;
+                    }
+                    if (mutation.type === 'attributes' && TRANSLATABLE_ATTRS.includes(mutation.attributeName || '')) {
+                        schedulePageTranslation();
+                        return;
+                    }
+                }
+            });
+
+            translationObserver.observe(document.body, {
+                childList: true,
+                subtree: true,
+                characterData: true,
+                attributes: true,
+                attributeFilter: TRANSLATABLE_ATTRS
+            });
+        }
+
+        function schedulePageTranslation() {
+            if (currentPageLanguage !== PAGE_LANGUAGE.EN || translationScheduled) return;
+
+            translationScheduled = true;
+            window.setTimeout(() => {
+                translationScheduled = false;
+                translateCurrentPage(translationGeneration).catch((error) => {
+                    console.error('Scheduled page translation failed:', error);
+                });
+            }, 150);
+        }
+
+        async function switchPageLanguage(nextLanguage, options = {}) {
+            const normalized = nextLanguage === PAGE_LANGUAGE.EN ? PAGE_LANGUAGE.EN : PAGE_LANGUAGE.ZH;
+            currentPageLanguage = normalized;
+            document.documentElement.lang = normalized;
+
+            if (options.persist !== false) {
+                persistPageLanguage();
+            }
+
+            translationGeneration += 1;
+            const generation = translationGeneration;
+            updateLanguageToggleState(true);
+
+            if (normalized === PAGE_LANGUAGE.ZH) {
+                restoreOriginalPageText(document.body);
+                document.title = ORIGINAL_DOCUMENT_TITLE;
+                updateLanguageToggleState(false);
+                return;
+            }
+
+            try {
+                await translateCurrentPage(generation);
+            } catch (error) {
+                console.error('Page translation failed:', error);
+            } finally {
+                if (generation === translationGeneration) {
+                    updateLanguageToggleState(false);
+                }
+            }
+        }
+
+        function restoreOriginalPageText(root = document.body) {
+            if (!(root instanceof Node)) return;
+
+            isApplyingTranslations = true;
+            try {
+                walkTextNodes(root, (node) => {
+                    if (!textNodeOriginalMap.has(node)) return;
+                    node.nodeValue = textNodeOriginalMap.get(node);
+                    translatedTextNodeSet.delete(node);
+                });
+
+                if (root instanceof Element) {
+                    walkElementNodes(root, (element) => {
+                        const originalAttrs = elementAttributeOriginalMap.get(element);
+                        if (!originalAttrs) return;
+
+                        const translatedAttrs = translatedElementAttrsMap.get(element);
+                        Object.entries(originalAttrs).forEach(([attr, value]) => {
+                            element.setAttribute(attr, value);
+                            translatedAttrs?.delete(attr);
+                        });
+                    });
+                }
+            } finally {
+                isApplyingTranslations = false;
+            }
+        }
+
+        function collectTranslationTasks(root) {
+            const tasks = [];
+            if (!(root instanceof Node)) return tasks;
+
+            walkTextNodes(root, (node) => {
+                const parent = node.parentElement;
+                if (!parent || shouldSkipElement(parent)) return;
+
+                const currentText = node.nodeValue || '';
+                if (!currentText.trim()) return;
+
+                let originalText = textNodeOriginalMap.get(node);
+                if (!originalText) {
+                    originalText = currentText;
+                    textNodeOriginalMap.set(node, originalText);
+                } else if (!translatedTextNodeSet.has(node) && containsChineseText(currentText) && currentText !== originalText) {
+                    originalText = currentText;
+                    textNodeOriginalMap.set(node, originalText);
+                }
+
+                const originalParts = splitTextPadding(originalText);
+                const cachedTranslated = translationCache.get(originalParts.core);
+                const expectedTranslated = cachedTranslated !== undefined
+                    ? `${originalParts.leading}${cachedTranslated}${originalParts.trailing}`
+                    : null;
+
+                if (translatedTextNodeSet.has(node)) {
+                    if (expectedTranslated !== null && currentText === expectedTranslated) return;
+                    if (currentText === originalText) {
+                        translatedTextNodeSet.delete(node);
+                    } else if (containsChineseText(currentText)) {
+                        originalText = currentText;
+                        textNodeOriginalMap.set(node, originalText);
+                        translatedTextNodeSet.delete(node);
+                    } else {
+                        return;
+                    }
+                }
+
+                const parts = splitTextPadding(originalText);
+                if (!containsChineseText(parts.core)) return;
+
+                tasks.push({
+                    sourceText: parts.core,
+                    apply(translatedText) {
+                        node.nodeValue = `${parts.leading}${translatedText}${parts.trailing}`;
+                        translatedTextNodeSet.add(node);
+                    }
+                });
+            });
+
+            if (root instanceof Element) {
+                walkElementNodes(root, (element) => {
+                    if (shouldSkipElement(element)) return;
+
+                    const originalAttrs = getElementOriginalAttrs(element);
+                    const translatedAttrs = getElementTranslatedAttrs(element);
+
+                    TRANSLATABLE_ATTRS.forEach((attr) => {
+                        if (!element.hasAttribute(attr)) return;
+
+                        const currentValue = element.getAttribute(attr) || '';
+                        if (!currentValue.trim()) return;
+
+                        if (!(attr in originalAttrs)) {
+                            originalAttrs[attr] = currentValue;
+                        } else if (!translatedAttrs.has(attr) && containsChineseText(currentValue) && currentValue !== originalAttrs[attr]) {
+                            originalAttrs[attr] = currentValue;
+                        }
+
+                        const originalValue = originalAttrs[attr];
+                        const expectedTranslated = translationCache.get(originalValue);
+
+                        if (translatedAttrs.has(attr)) {
+                            if (expectedTranslated !== undefined && currentValue === expectedTranslated) return;
+                            if (currentValue === originalValue) {
+                                translatedAttrs.delete(attr);
+                            } else if (containsChineseText(currentValue)) {
+                                originalAttrs[attr] = currentValue;
+                                translatedAttrs.delete(attr);
+                            } else {
+                                return;
+                            }
+                        }
+
+                        if (!containsChineseText(originalAttrs[attr])) return;
+
+                        tasks.push({
+                            sourceText: originalAttrs[attr],
+                            apply(translatedText) {
+                                element.setAttribute(attr, translatedText);
+                                translatedAttrs.add(attr);
+                            }
+                        });
+                    });
+                });
+            }
+
+            return tasks;
+        }
+
+        async function translateCurrentPage(generation = translationGeneration) {
+            if (currentPageLanguage !== PAGE_LANGUAGE.EN) return;
+
+            const tasks = collectTranslationTasks(document.body);
+            const uniqueTexts = Array.from(new Set(tasks.map(task => task.sourceText)));
+            if (containsChineseText(ORIGINAL_DOCUMENT_TITLE)) {
+                uniqueTexts.push(ORIGINAL_DOCUMENT_TITLE);
+            }
+
+            const dedupedTexts = Array.from(new Set(uniqueTexts));
+            if (!dedupedTexts.length) {
+                document.title = ORIGINAL_DOCUMENT_TITLE;
+                return;
+            }
+
+            const translatedList = await translateTextArray(dedupedTexts, generation);
+            if (generation !== translationGeneration || currentPageLanguage !== PAGE_LANGUAGE.EN) return;
+
+            const translatedMap = new Map(dedupedTexts.map((text, index) => [text, translatedList[index] || text]));
+
+            isApplyingTranslations = true;
+            try {
+                tasks.forEach((task) => {
+                    task.apply(translatedMap.get(task.sourceText) || task.sourceText);
+                });
+                document.title = translatedMap.get(ORIGINAL_DOCUMENT_TITLE) || ORIGINAL_DOCUMENT_TITLE;
+            } finally {
+                isApplyingTranslations = false;
+            }
+        }
+
+        function buildTranslationBatches(texts) {
+            const batches = [];
+            let currentBatch = [];
+            let currentEncodedLength = 0;
+
+            texts.forEach((text) => {
+                const prefix = currentBatch.length ? TRANSLATE_SEPARATOR : '';
+                const nextEncodedLength = currentEncodedLength + encodeURIComponent(prefix + text).length;
+
+                if (currentBatch.length && nextEncodedLength > TRANSLATION_BATCH_MAX_ENCODED_LENGTH) {
+                    batches.push(currentBatch);
+                    currentBatch = [text];
+                    currentEncodedLength = encodeURIComponent(text).length;
+                    return;
+                }
+
+                currentBatch.push(text);
+                currentEncodedLength = nextEncodedLength;
+            });
+
+            if (currentBatch.length) {
+                batches.push(currentBatch);
+            }
+
+            return batches;
+        }
+
+        function splitTranslatedBatch(text, expectedCount) {
+            const exact = String(text || '').split(TRANSLATE_SEPARATOR);
+            if (exact.length === expectedCount) return exact;
+
+            const normalized = String(text || '').split(/\n__\s*LLM_SPEEDTEST_SPLIT\s*__\n/gi);
+            if (normalized.length === expectedCount) return normalized;
+
+            throw new Error(`Translated batch size mismatch: expected ${expectedCount}, got ${exact.length}`);
+        }
+
+        async function translateTextArray(texts, generation = translationGeneration) {
+            const normalizedTexts = texts.map(text => String(text || ''));
+            const missingTexts = normalizedTexts.filter(text => containsChineseText(text) && !translationCache.has(text));
+
+            if (missingTexts.length) {
+                const batches = buildTranslationBatches(Array.from(new Set(missingTexts)));
+
+                for (const batch of batches) {
+                    if (generation !== translationGeneration || currentPageLanguage !== PAGE_LANGUAGE.EN) break;
+                    const translatedBatch = await translateBatchWithFallbacks(batch);
+                    batch.forEach((sourceText, index) => {
+                        translationCache.set(sourceText, translatedBatch[index] || sourceText);
+                    });
+                }
+            }
+
+            return normalizedTexts.map(text => translationCache.get(text) || text);
+        }
+
+        async function translateBatchWithFallbacks(batch) {
+            const providers = [
+                { label: 'Microsoft Edge Translator', run: translateBatchWithEdgeNative },
+                { label: 'MyMemory Public API', run: translateBatchWithMyMemory },
+                { label: 'Google Translate Public API', run: translateBatchWithGoogle }
+            ];
+
+            const errors = [];
+
+            for (const provider of providers) {
+                try {
+                    const translated = await provider.run(batch);
+                    if (!Array.isArray(translated) || translated.length !== batch.length) {
+                        throw new Error(`Invalid translation batch from ${provider.label}`);
+                    }
+                    translationProviderLabel = provider.label;
+                    return translated;
+                } catch (error) {
+                    errors.push(`${provider.label}: ${error.message}`);
+                }
+            }
+
+            throw new Error(errors.join(' | '));
+        }
+
+        async function getEdgeTranslatorSession() {
+            if (edgeTranslatorSession) return edgeTranslatorSession;
+            if (edgeTranslatorPromise) return edgeTranslatorPromise;
+
+            const TranslatorCtor = window.Translator || self.Translator;
+            if (!TranslatorCtor || typeof TranslatorCtor.create !== 'function' || typeof TranslatorCtor.availability !== 'function') {
+                throw new Error('Translator API unavailable');
+            }
+
+            edgeTranslatorPromise = (async () => {
+                const availability = await TranslatorCtor.availability({
+                    sourceLanguage: 'zh-Hans',
+                    targetLanguage: 'en'
+                });
+
+                if (availability === 'unavailable' || availability === false) {
+                    throw new Error('zh-Hans -> en not available');
+                }
+
+                return TranslatorCtor.create({
+                    sourceLanguage: 'zh-Hans',
+                    targetLanguage: 'en'
+                });
+            })();
+
+            try {
+                edgeTranslatorSession = await edgeTranslatorPromise;
+                return edgeTranslatorSession;
+            } catch (error) {
+                edgeTranslatorPromise = null;
+                throw error;
+            }
+        }
+
+        async function runWithConcurrency(items, concurrency, worker) {
+            const results = new Array(items.length);
+            let cursor = 0;
+
+            async function consume() {
+                while (cursor < items.length) {
+                    const index = cursor++;
+                    results[index] = await worker(items[index], index);
+                }
+            }
+
+            const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, () => consume());
+            await Promise.all(workers);
+            return results;
+        }
+
+        async function translateBatchWithEdgeNative(batch) {
+            const translator = await getEdgeTranslatorSession();
+            return runWithConcurrency(batch, 4, async (text) => {
+                const translated = await translator.translate(text);
+                return typeof translated === 'string' ? translated : String(translated || text);
+            });
+        }
+
+        async function translateBatchWithMyMemory(batch) {
+            return runWithConcurrency(batch, 3, async (text) => {
+                const url = new URL('https://api.mymemory.translated.net/get');
+                url.searchParams.set('q', text);
+                url.searchParams.set('langpair', 'zh-CN|en');
+
+                const response = await fetch(url.toString());
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const payload = await response.json();
+                const translatedText = payload?.responseData?.translatedText;
+                return translatedText ? String(translatedText) : text;
+            });
+        }
+
+        async function translateBatchWithGoogle(batch) {
+            const url = new URL('https://translate.googleapis.com/translate_a/single');
+            url.searchParams.set('client', 'gtx');
+            url.searchParams.set('sl', 'zh-CN');
+            url.searchParams.set('tl', 'en');
+            url.searchParams.append('dt', 't');
+            url.searchParams.set('q', batch.join(TRANSLATE_SEPARATOR));
+
+            const response = await fetch(url.toString());
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+
+            const payload = await response.json();
+            const segments = Array.isArray(payload?.[0]) ? payload[0] : [];
+            const translatedText = segments.map(segment => Array.isArray(segment) ? (segment[0] || '') : '').join('');
+            return splitTranslatedBatch(translatedText, batch.length);
+        }
+
+        async function translateUiString(text, generation = translationGeneration) {
+            if (!containsChineseText(text) || currentPageLanguage !== PAGE_LANGUAGE.EN) {
+                return text;
+            }
+            const [translated] = await translateTextArray([text], generation);
+            return translated || text;
         }
 
         function updateModelTagSubtitle() {
@@ -2155,6 +2759,11 @@
         }
 
         window.onload = () => {
+            currentPageLanguage = getStoredPageLanguage();
+            document.documentElement.lang = currentPageLanguage;
+            initializePageTranslation();
+            updateLanguageToggleState(false);
+
             const pageEl = document.getElementById('pageSizeSelect');
             if (pageEl) pageEl.value = String(currentPageSize);
             updateSortIndicators();
@@ -2177,6 +2786,7 @@
             });
 
             refreshModelTags();
+            const shouldBootInEnglish = currentPageLanguage === PAGE_LANGUAGE.EN;
 
             const shareId = getShareIdFromUrl();
             if (shareId) {
@@ -2185,9 +2795,21 @@
                 const searchInput = document.getElementById('searchInput');
                 if (searchInput) searchInput.value = shareId;
                 loadLeaderboard('search_id');
+                if (shouldBootInEnglish) {
+                    translationGeneration += 1;
+                    translateCurrentPage(translationGeneration).catch((error) => {
+                        console.error('Initial page translation failed:', error);
+                    });
+                }
                 return;
             }
             loadLeaderboard('global');
+            if (shouldBootInEnglish) {
+                translationGeneration += 1;
+                translateCurrentPage(translationGeneration).catch((error) => {
+                    console.error('Initial page translation failed:', error);
+                });
+            }
         };
 
         async function loadLeaderboard(mode, resetPage = true) {
@@ -2360,6 +2982,10 @@
                 btnPrev.style.display = currentPage > 1 ? 'inline-block' : 'none';
                 btnNext.style.display = (offset + data.length) < totalMatched ? 'inline-block' : 'none';
 
+                if (currentPageLanguage === PAGE_LANGUAGE.EN) {
+                    schedulePageTranslation();
+                }
+
             } catch (e) {
                 if (e.name === 'AbortError') {
                     console.log('Fetch aborted due to tab switch.');
@@ -2424,7 +3050,7 @@
             }
         }
 
-        function viewDetails(id) {
+        async function viewDetails(id) {
             const row = resultsDataMap[id];
             if (!row) return;
 
@@ -2579,13 +3205,26 @@
             Chart.defaults.color = '#abb2bf';
             Chart.defaults.borderColor = '#3e4451';
 
-            buildChart('prefill', 'prefillChart', '总 Prefill 吞吐 (tokens/s)', labels, prefillData, '#98c379');
-            buildChart('decode', 'decodeChart', '总 Decode 吞吐 (tokens/s)', labels, decodeData, '#c678dd');
-            buildChart('ttft', 'ttftChart', 'TTFT 首字延迟 (ms)', labels, ttftData, '#61afef');
-            buildChart('itl', 'itlChart', 'ITL 均值延迟 (ms)', labels, itlData, '#e5c07b');
+            const translationSeed = translationGeneration;
+            const [prefillChartLabel, decodeChartLabel, ttftChartLabel, itlChartLabel, emptyStateLabel] = await Promise.all([
+                translateUiString('总 Prefill 吞吐 (tokens/s)', translationSeed),
+                translateUiString('总 Decode 吞吐 (tokens/s)', translationSeed),
+                translateUiString('TTFT 首字延迟 (ms)', translationSeed),
+                translateUiString('ITL 均值延迟 (ms)', translationSeed),
+                translateUiString('无有效数据', translationSeed)
+            ]);
+
+            buildChart('prefill', 'prefillChart', prefillChartLabel, 'tokens/s', labels, prefillData, '#98c379', emptyStateLabel);
+            buildChart('decode', 'decodeChart', decodeChartLabel, 'tokens/s', labels, decodeData, '#c678dd', emptyStateLabel);
+            buildChart('ttft', 'ttftChart', ttftChartLabel, 'ms', labels, ttftData, '#61afef', emptyStateLabel);
+            buildChart('itl', 'itlChart', itlChartLabel, 'ms', labels, itlData, '#e5c07b', emptyStateLabel);
+
+            if (currentPageLanguage === PAGE_LANGUAGE.EN) {
+                schedulePageTranslation();
+            }
         }
 
-        function buildChart(key, canvasId, label, labels, data, color) {
+        function buildChart(key, canvasId, label, yAxisTitle, labels, data, color, emptyStateLabel = '无有效数据') {
             if (charts[key]) {
                 charts[key].destroy();
             }
@@ -2600,7 +3239,7 @@
                 data: {
                     labels: labels,
                     datasets: [{
-                        label: allNull ? label + ' (无有效数据)' : label,
+                        label: allNull ? `${label} (${emptyStateLabel})` : label,
                         data: data,
                         borderColor: color,
                         backgroundColor: color + '33',
@@ -2636,7 +3275,7 @@
                             grid: { color: '#3e4451' }
                         },
                         y: {
-                            title: { display: true, text: label.split(' ')[1], color: '#5c6370' },
+                            title: { display: true, text: yAxisTitle, color: '#5c6370' },
                             grid: { color: '#3e4451' },
                             beginAtZero: true
                         }
