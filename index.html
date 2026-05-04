@@ -2175,20 +2175,143 @@
         ];
 
         // 根据指定长度生成提示词
+        const DEFAULT_SYSTEM_PROMPT = 'You are a helpful assistant.';
+        const DEFAULT_BENCHMARK_SUFFIX = '\nBased on the words above, write a short philosophical essay discussing the meaning of existence, the nature of consciousness, and humanity\'s place in the universe. Use clear, coherent sentences.';
+        const ASCII_FILLER_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789';
+        const PROMPT_TOKEN_WORDS = [
+            'a', 'the', 'and', 'of', 'to', 'in', 'is', 'it', 'that', 'for', 'with', 'as',
+            'on', 'by', 'from', 'this', 'be', 'are', 'or', 'not', 'we', 'you', 'they',
+            'can', 'will', 'if', 'all', 'one', 'time', 'world', 'life', 'work', 'data',
+            'model', 'token', 'text', 'idea', 'mind', 'story', 'light', 'space', 'future',
+            'human', 'system', 'simple', 'clear', 'reason', 'change', 'value', 'truth'
+        ].filter(word => estimateTokenCount(word) === 1);
+        const SHORT_PROMPT_MAX_LENGTH = 46;
+        const BENCHMARK_SUFFIX_TOKEN_LENGTH = SHORT_PROMPT_MAX_LENGTH + 1;
+
+        function estimateTokenWeight(text) {
+            return estimateTokenCount(text);
+        }
+
+        function estimatePromptTokensForRequest(promptText) {
+            return estimateTokenCount(DEFAULT_SYSTEM_PROMPT) + estimateTokenCount(promptText);
+        }
+
+        function buildPromptCalibration(promptText, actualPromptTokens) {
+            if (!hasPositiveNumber(actualPromptTokens)) return null;
+            const estimatedPromptTokens = estimatePromptTokensForRequest(promptText);
+            const tokenOffset = Math.trunc(actualPromptTokens) - estimatedPromptTokens;
+            return {
+                source: 'warmup_usage',
+                estimatedPromptTokens,
+                actualPromptTokens: Math.trunc(actualPromptTokens),
+                tokenOffset,
+                tokenRatio: Math.trunc(actualPromptTokens) / Math.max(estimatedPromptTokens, 1)
+            };
+        }
+
+        function applyPromptCalibration(estimatedPromptTokens, calibration) {
+            const estimate = Math.max(Math.trunc(estimatedPromptTokens || 0), 1);
+            if (!calibration || !Number.isFinite(calibration.tokenOffset)) return estimate;
+            return Math.max(Math.round(estimate + calibration.tokenOffset), 1);
+        }
+
+        function getResolvedPromptLength(length) {
+            const numericLength = Number(length);
+            const requestedLength = Number.isFinite(numericLength) ? Math.max(0, Math.trunc(numericLength)) : 0;
+            return Math.max(requestedLength, 1);
+        }
+
+        function getCalibratedGenerationPromptLength(length, calibration) {
+            const resolvedLength = getResolvedPromptLength(length);
+            if (!calibration || !Number.isFinite(calibration.tokenOffset)) return resolvedLength;
+            if (resolvedLength <= SHORT_PROMPT_MAX_LENGTH) return resolvedLength;
+
+            const systemTokens = estimateTokenCount(DEFAULT_SYSTEM_PROMPT);
+            const calibratedUserLength = Math.round(resolvedLength - systemTokens - calibration.tokenOffset);
+            return Math.max(BENCHMARK_SUFFIX_TOKEN_LENGTH, calibratedUserLength);
+        }
+
+        function buildAsciiFiller(charCount, seed = 0) {
+            let filler = '';
+            const offset = Math.max(seed, 0) % ASCII_FILLER_CHARS.length;
+            for (let i = 0; i < charCount; i++) {
+                filler += ASCII_FILLER_CHARS[(offset + i) % ASCII_FILLER_CHARS.length];
+            }
+            return filler;
+        }
+
+        function seededRandom(seed = 0) {
+            let state = (Date.now() ^ ((seed + 1) * 1000003)) >>> 0;
+            return () => {
+                state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+                return state / 4294967296;
+            };
+        }
+
+        function buildTokenWordSequence(tokenCount, seed = 0) {
+            const targetTokenCount = Math.max(Math.trunc(Number(tokenCount) || 0), 0);
+            if (targetTokenCount <= 0) return '';
+
+            const random = seededRandom(seed);
+            const words = [];
+            for (let i = 0; i < targetTokenCount; i++) {
+                words.push(PROMPT_TOKEN_WORDS[Math.floor(random() * PROMPT_TOKEN_WORDS.length)]);
+            }
+            return words.join(' ');
+        }
+
+        function hasPositiveNumber(value) {
+            return Number.isFinite(value) && value > 0;
+        }
+
+        function calculateAggregateThroughputMetrics(results) {
+            const totalPromptTokens = results.reduce((sum, result) => sum + (result.actualPromptTokens || 0), 0);
+            const totalOutputTokens = results.reduce((sum, result) => sum + (result.outputTokens || 0), 0);
+
+            const useServerPrefill = results.length > 0 && results.every(result => hasPositiveNumber(result.serverPrefillTimeMs ?? result.serverPrefillDurationMs));
+            const averageNetworkLatencyMs = getAverageNetworkLatencyMs(results.map(result => result.networkLatencyMs));
+            const rawPrefillDurationMs = useServerPrefill
+                ? Math.max(...results.map(result => result.serverPrefillTimeMs ?? result.serverPrefillDurationMs))
+                : Math.max(...results.map(result => result.firstTokenTimestamp ?? result.endTimestamp)) - Math.min(...results.map(result => result.startTimestamp));
+            const prefillDurationMs = useServerPrefill
+                ? rawPrefillDurationMs
+                : Math.max(rawPrefillDurationMs - averageNetworkLatencyMs, 1);
+
+            const useServerDecode = results.length > 0 && results.every(result => hasPositiveNumber(result.serverDecodeTimeMs ?? result.serverOutputDurationMs));
+            const decodeDurationMs = useServerDecode
+                ? Math.max(...results.map(result => result.serverDecodeTimeMs ?? result.serverOutputDurationMs))
+                : Math.max(...results.map(result => result.endTimestamp)) - Math.min(...results.map(result => result.firstTokenTimestamp ?? result.endTimestamp));
+
+            return {
+                totalPromptTokens,
+                totalOutputTokens,
+                prefillDurationMs: Math.max(prefillDurationMs, 1),
+                decodeDurationMs: Math.max(decodeDurationMs, 1),
+                prefillSource: useServerPrefill ? 'server' : (averageNetworkLatencyMs > 0 ? 'client_latency_adjusted' : 'client'),
+                decodeSource: useServerDecode ? 'server' : 'client'
+            };
+        }
+
+        function generateShortPrompt(length, seed = 0) {
+            const targetPromptLength = getResolvedPromptLength(length);
+            return buildTokenWordSequence(targetPromptLength, seed);
+        }
+
         function generatePrompt(length, apiType, seed = 0) {
-            let prompt = [];
-
-            //  添加唯一前缀以避免prefix cache命中（并发测试时很重要）
-            if (seed > 0) {
-                prompt.push(`[Request-${seed}-${Date.now()}]`);
+            const targetPromptLength = getResolvedPromptLength(length);
+            if (targetPromptLength <= SHORT_PROMPT_MAX_LENGTH) {
+                return generateShortPrompt(targetPromptLength, seed);
             }
 
-            for (let i = 0; i < length - 20; i++) {
-                const randomIndex = Math.floor(Math.random() * wordList.length);
-                prompt.push(wordList[randomIndex]);
-            }
+            const suffixText = DEFAULT_BENCHMARK_SUFFIX.trim();
+            const suffixTokens = estimateTokenCount(suffixText);
+            const prefixTokenCount = Math.max(targetPromptLength - suffixTokens, 0);
+            const prefixText = buildTokenWordSequence(prefixTokenCount, seed);
 
-            return prompt.join(' ') + `\nBased on the words above, write a short philosophical essay discussing the meaning of existence, the nature of consciousness, and humanity's place in the universe. Use clear, coherent sentences.`;
+            if (prefixText) {
+                return prefixText + '\n' + suffixText;
+            }
+            return suffixText;
         }
 
         const startTestBtn = document.getElementById('startTest');
@@ -2645,8 +2768,8 @@
         }
 
         function createWarmupPrompt() {
-            const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-            return `Warmup request ${nonce}. Reply with one short word only.`;
+            const seed = Math.floor(Math.random() * 1000000) + 1;
+            return generatePrompt(96, 'openai', seed);
         }
 
         async function sendWarmupRequest(apiUrl, apiType, modelName, timeout) {
@@ -2654,6 +2777,7 @@
             const warmupTimeout = Math.max(Number(timeout) || 0, 15000);
             const headers = { 'Content-Type': 'application/json' };
             let requestBody;
+            let calibration = null;
 
             if (apiType === 'openai') {
                 if (api_key) {
@@ -2662,7 +2786,7 @@
                 requestBody = {
                     "model": modelName,
                     "messages": [
-                        { "role": "system", "content": "You are a helpful assistant." },
+                        { "role": "system", "content": DEFAULT_SYSTEM_PROMPT },
                         { "role": "user", "content": warmupPrompt }
                     ],
                     "max_tokens": 8,
@@ -2672,7 +2796,7 @@
                 requestBody = {
                     "model": modelName,
                     "messages": [
-                        { "role": "system", "content": "You are a helpful assistant." },
+                        { "role": "system", "content": DEFAULT_SYSTEM_PROMPT },
                         { "role": "user", "content": warmupPrompt }
                     ],
                     "options": { "num_predict": 8 },
@@ -2698,8 +2822,23 @@
                     throw new Error(errorText ? `HTTP ${response.status}: ${errorText}` : `HTTP ${response.status}`);
                 }
 
-                await response.text();
+                const responseText = await response.text();
+                try {
+                    const data = JSON.parse(responseText);
+                    let actualPromptTokens = null;
+                    if (data?.usage) {
+                        actualPromptTokens = extractUsageTokenStats(data.usage).promptTokens;
+                    } else if (data?.prompt_eval_count !== undefined) {
+                        actualPromptTokens = toTokenNumber(data.prompt_eval_count);
+                    }
+                    calibration = buildPromptCalibration(warmupPrompt, actualPromptTokens);
+                } catch (parseError) {
+                    calibration = null;
+                }
                 console.log('[Warmup] Warmup request completed.');
+                if (calibration) {
+                    console.log(`[Warmup] Prompt calibration: estimated=${calibration.estimatedPromptTokens}, actual=${calibration.actualPromptTokens}, offset=${calibration.tokenOffset}, ratio=${calibration.tokenRatio.toFixed(3)}`);
+                }
             } catch (error) {
                 console.warn('[Warmup] Warmup request failed:', getFriendlyFetchErrorMessage(error, apiUrl));
             } finally {
@@ -2707,27 +2846,141 @@
             }
 
             await new Promise(resolve => setTimeout(resolve, 800));
+            return calibration;
         }
 
+        // 网络延迟采样工具：测速开始后多次采样，取平均值用于客户端TTFT扣除。
+        function createLatencyProbePrompt() {
+            const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+            return `Latency probe ${nonce}. Reply ok.`;
+        }
 
-        //  Token估算函数（当API不返回usage时的fallback）
+        function getAverageNetworkLatencyMs(latencySamples) {
+            let validSamples = latencySamples.filter(value => Number.isFinite(value) && value > 0);
+            if (validSamples.length === 0) return 0;
+            if (validSamples.length >= 3) {
+                validSamples = [...validSamples].sort((a, b) => a - b).slice(1, -1);
+            }
+            return validSamples.reduce((sum, value) => sum + value, 0) / validSamples.length;
+        }
+
+        async function measureNetworkLatencySample(apiUrl, apiType, modelName, timeout) {
+            const probeTimeout = Math.min(Math.max(Number(timeout) || 0, 3000), 8000);
+
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), probeTimeout);
+                const start = performance.now();
+                const response = await fetch(apiUrl, { method: 'OPTIONS', signal: controller.signal });
+                await response.text().catch(() => '');
+                clearTimeout(timeoutId);
+                return { latencyMs: performance.now() - start, probeType: `OPTIONS ${response.status}` };
+            } catch (error) {
+                console.warn('[Latency] OPTIONS latency probe failed, falling back to a tiny completion:', getFriendlyFetchErrorMessage(error, apiUrl));
+            }
+
+            const headers = { 'Content-Type': 'application/json' };
+            let requestBody;
+            if (apiType === 'openai') {
+                if (api_key) {
+                    headers['Authorization'] = `Bearer ${api_key}`;
+                }
+                requestBody = {
+                    model: modelName,
+                    messages: [
+                        { role: 'system', content: DEFAULT_SYSTEM_PROMPT },
+                        { role: 'user', content: createLatencyProbePrompt() }
+                    ],
+                    max_tokens: 1,
+                    stream: false
+                };
+            } else {
+                requestBody = {
+                    model: modelName,
+                    messages: [
+                        { role: 'system', content: DEFAULT_SYSTEM_PROMPT },
+                        { role: 'user', content: createLatencyProbePrompt() }
+                    ],
+                    options: { num_predict: 1 },
+                    stream: false
+                };
+            }
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), probeTimeout);
+            const start = performance.now();
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify(requestBody),
+                    signal: controller.signal
+                });
+                await response.text().catch(() => '');
+                return { latencyMs: performance.now() - start, probeType: `tiny_completion ${response.status}` };
+            } finally {
+                clearTimeout(timeoutId);
+            }
+        }
+
+        async function collectNetworkLatencySample(latencySamples, apiUrl, apiType, modelName, timeout) {
+            try {
+                const sample = await measureNetworkLatencySample(apiUrl, apiType, modelName, timeout);
+                if (sample && Number.isFinite(sample.latencyMs) && sample.latencyMs > 0) {
+                    latencySamples.push(sample.latencyMs);
+                    if (latencySamples.length > 20) latencySamples.shift();
+                    console.log(`[Latency] ${sample.probeType}: ${sample.latencyMs.toFixed(2)}ms, avg=${getAverageNetworkLatencyMs(latencySamples).toFixed(2)}ms, samples=${latencySamples.length}`);
+                }
+            } catch (error) {
+                console.warn('[Latency] latency probe failed:', getFriendlyFetchErrorMessage(error, apiUrl));
+            }
+
+            return getAverageNetworkLatencyMs(latencySamples);
+        }
+
         function estimateTokenCount(text) {
             if (!text || text.length === 0) return 0;
 
-            // 统计中文字符数量
-            const chineseChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
-            // 其他字符（英文、数字、符号等）
-            const otherChars = text.length - chineseChars;
+            let tokenCount = 0;
+            let index = 0;
 
-            // 粗略估算：中文约1.5字符=1token，英文约4字符=1token
-            const estimatedTokens = Math.round(chineseChars / 1.5 + otherChars / 4);
+            const isCjkChar = char => /[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(char);
+            const isAsciiWordChar = char => /^[A-Za-z0-9_]$/.test(char);
+            const estimateAsciiRunTokens = run => Math.max(1, Math.ceil(run.length / 12));
 
-            console.log(`[Token估算] 总字符: ${text.length}, 中文: ${chineseChars}, 其他: ${otherChars}, 估算tokens: ${estimatedTokens}`);
+            while (index < text.length) {
+                const char = text[index];
+                if (/\s/.test(char)) {
+                    index += 1;
+                    continue;
+                }
+
+                if (isCjkChar(char)) {
+                    tokenCount += 1;
+                    index += 1;
+                    continue;
+                }
+
+                if (isAsciiWordChar(char)) {
+                    const start = index;
+                    while (index < text.length && isAsciiWordChar(text[index])) {
+                        index += 1;
+                    }
+                    tokenCount += estimateAsciiRunTokens(text.slice(start, index));
+                    continue;
+                }
+
+                tokenCount += 1;
+                index += 1;
+            }
+
+            const estimatedTokens = Math.max(1, tokenCount);
+            console.log(`[Token估算] 总字符: ${text.length}, 共享估算tokens: ${estimatedTokens}`);
 
             return estimatedTokens;
         }
 
-        // 【修复】测试OpenAI兼容接口
         function toTokenNumber(value) {
             if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null;
             const num = Number(value);
@@ -2796,12 +3049,20 @@
         }
 
         async function testOpenAI(apiUrl, modelName, testLengths, outputLength, temperature, top_p, presence_penalty, frequency_penalty, concurrency, timeout) {
+            const latencySamples = [];
+            let promptCalibration = null;
             if (testLengths.length > 0) {
-                await sendWarmupRequest(apiUrl, 'openai', modelName, timeout);
+                promptCalibration = await sendWarmupRequest(apiUrl, 'openai', modelName, timeout);
+                await collectNetworkLatencySample(latencySamples, apiUrl, 'openai', modelName, timeout);
+                await collectNetworkLatencySample(latencySamples, apiUrl, 'openai', modelName, timeout);
             }
 
             for (let length of testLengths) {
                 if (!isTestingRunning) break;
+                const networkLatencyMs = await collectNetworkLatencySample(latencySamples, apiUrl, 'openai', modelName, timeout);
+                const requestedPromptLength = length;
+                const resolvedPromptLength = getResolvedPromptLength(length);
+                length = resolvedPromptLength;
 
                 // F12控制台日志
                 console.log(`[Test] 准备测试提示词长度: ${length}`);
@@ -2815,7 +3076,7 @@
                     row.appendChild(cell);
                 }
 
-                cells[0].textContent = length;
+                cells[0].textContent = resolvedPromptLength;
                 cells[1].textContent = translations[currentLang].msgTesting;
                 cells[2].textContent = translations[currentLang].msgTesting;
                 cells[3].textContent = translations[currentLang].msgTesting;
@@ -2827,7 +3088,8 @@
                 resultsDiv.scrollTop = resultsDiv.scrollHeight;
 
                 let resultEntry = {
-                    promptLength: length,
+                    promptLength: resolvedPromptLength,
+                    requestedPromptLength: requestedPromptLength,
                     ttftMs: 'N/A',
                     prefillTimeMs: 'N/A',
                     prefillSpeed: 'N/A',
@@ -2848,13 +3110,15 @@
 
                 for (let i = 0; i < concurrency; i++) {
                     //  传入seed确保每个并发请求的prompt都不同，避免prefix cache命中
-                    const prompt = generatePrompt(length, 'openai', i + 1);
+                    const generationPromptLength = getCalibratedGenerationPromptLength(length, promptCalibration);
+                    const prompt = generatePrompt(generationPromptLength, 'openai', i + 1);
+                    const promptTokenEstimate = applyPromptCalibration(estimatePromptTokensForRequest(prompt), promptCalibration);
                     if (i === 0) firstPrompt = prompt; // 保存第一个prompt
 
                     const requestBody = {
                         "model": modelName,
                         "messages": [
-                            { "role": "system", "content": "You are a helpful assistant." },
+                            { "role": "system", "content": DEFAULT_SYSTEM_PROMPT },
                             { "role": "user", "content": prompt }
                         ],
                         "max_tokens": outputLength,
@@ -2876,7 +3140,7 @@
                     };
 
                     measurementPromises.push(
-                        executeAndMeasureRequest(apiUrl, fetchOptions, timeout, length)
+                        executeAndMeasureRequest(apiUrl, fetchOptions, timeout, resolvedPromptLength, promptTokenEstimate, networkLatencyMs, latencySamples.length)
                     );
                 }
 
@@ -2900,9 +3164,7 @@
                     }
 
                     //
-                    const avgPrefillTimeMs = concurrencyResults.reduce((sum, res) => sum + res.prefillTimeMs, 0) / concurrencyResults.length;
                     const avgOutputTokens = concurrencyResults.reduce((sum, res) => sum + res.outputTokens, 0) / concurrencyResults.length;
-                    const avgOutputTimeMs = concurrencyResults.reduce((sum, res) => sum + res.outputTimeMs, 0) / concurrencyResults.length;
 
                     const avgTtftMs = concurrencyResults.reduce((sum, res) => sum + res.ttftMs || 0, 0) / concurrencyResults.length;
                     const avgItlMean = concurrencyResults.reduce((sum, res) => sum + res.itlMean || 0, 0) / concurrencyResults.length;
@@ -2915,17 +3177,18 @@
                     }, 0) / concurrencyResults.length;
 
                     // 计算真实的总吞吐（基于时间戳）
-                    const minStartTime = Math.min(...concurrencyResults.map(r => r.startTimestamp));
-                    const maxFirstTokenTime = Math.max(...concurrencyResults.map(r => r.firstTokenTimestamp));
-                    const prefillDurationMs = maxFirstTokenTime - minStartTime;
-                    const totalPromptTokens = concurrencyResults.reduce((sum, r) => sum + r.actualPromptTokens, 0);
+                    const aggregateMetrics = calculateAggregateThroughputMetrics(concurrencyResults);
+                    const totalPromptTokens = aggregateMetrics.totalPromptTokens;
+                    const prefillDurationMs = aggregateMetrics.prefillDurationMs;
                     const totalPrefillSpeed = prefillDurationMs > 0 ? (totalPromptTokens / (prefillDurationMs / 1000)) : 0;
 
-                    const minFirstTokenTime = Math.min(...concurrencyResults.map(r => r.firstTokenTimestamp));
-                    const maxEndTime = Math.max(...concurrencyResults.map(r => r.endTimestamp));
-                    const decodeDurationMs = maxEndTime - minFirstTokenTime;
-                    const totalOutputTokens = concurrencyResults.reduce((sum, r) => sum + r.outputTokens, 0);
+                    const totalOutputTokens = aggregateMetrics.totalOutputTokens;
+                    const decodeDurationMs = aggregateMetrics.decodeDurationMs;
                     const totalOutputSpeed = decodeDurationMs > 0 ? (totalOutputTokens / (decodeDurationMs / 1000)) : 0;
+                    const minStartTime = Math.min(...concurrencyResults.map(r => r.startTimestamp));
+                    const maxFirstTokenTime = minStartTime + prefillDurationMs;
+                    const minFirstTokenTime = Math.min(...concurrencyResults.map(r => r.firstTokenTimestamp ?? r.endTimestamp));
+                    const maxEndTime = minFirstTokenTime + decodeDurationMs;
 
                     console.log(`[时间戳调试] minStartTime: ${minStartTime.toFixed(2)}, maxFirstTokenTime: ${maxFirstTokenTime.toFixed(2)}, minFirstTokenTime: ${minFirstTokenTime.toFixed(2)}, maxEndTime: ${maxEndTime.toFixed(2)}`);
                     console.log(`[并发总吞吐] Prefill: ${totalPromptTokens} tokens / ${prefillDurationMs.toFixed(2)}ms = ${totalPrefillSpeed.toFixed(2)} t/s`);
@@ -2952,15 +3215,20 @@
 
                     resultEntry = {
                         promptLength: actualPromptLength, //  修复：使用实际token数
-                        prefillTimeMs: avgPrefillTimeMs.toFixed(2),
+                        requestedPromptLength: length,
+                        prefillTimeMs: prefillDurationMs.toFixed(2),
                         prefillSpeed: totalPrefillSpeed.toFixed(2),
                         outputTokens: avgOutputTokens.toFixed(0),
-                        outputTimeMs: avgOutputTimeMs.toFixed(2),
+                        outputTimeMs: decodeDurationMs.toFixed(2),
                         outputSpeed: totalOutputSpeed.toFixed(2),
                         status: translations[currentLang].statusSuccess,
                         concurrency: concurrency,
                         avgTtftMs: avgTtftMs.toFixed(2),
                         avgItlMean: avgItlMean.toFixed(2),
+                        aggregatePrefillSource: aggregateMetrics.prefillSource,
+                        aggregateOutputSource: aggregateMetrics.decodeSource,
+                        networkLatencyMs: networkLatencyMs > 0 ? networkLatencyMs.toFixed(2) : 'N/A',
+                        networkLatencySampleCount: latencySamples.length,
                         // 保存并发详情（用于P50/P90/P95统计）
                         concurrentDetails: concurrencyResults.map(res => ({
                             prefillTimeMs: res.prefillTimeMs,
@@ -2969,7 +3237,14 @@
                             outputTimeMs: res.outputTimeMs,
                             outputSpeed: res.outputSpeed,
                             ttftMs: res.ttftMs,
-                            itlMean: res.itlMean
+                            itlMean: res.itlMean,
+                            actualPromptTokens: res.actualPromptTokens,
+                            serverPrefillTimeMs: res.serverPrefillTimeMs,
+                            serverDecodeTimeMs: res.serverDecodeTimeMs,
+                            prefillTimeSource: res.prefillTimeSource,
+                            outputTimeSource: res.outputTimeSource,
+                            networkLatencyMs: res.networkLatencyMs,
+                            networkLatencySampleCount: res.networkLatencySampleCount
                         })),
                         // 详情数据：保存第一个请求的prompt和output
                         promptText: firstPrompt,
@@ -2989,6 +3264,9 @@
                         },
                         timestamp: new Date().toISOString()
                     };
+
+                    resultEntry.promptLength = length;
+                    resultEntry.requestedPromptLength = requestedPromptLength;
 
                     console.log('[Debug] OpenAI resultEntry.usageInfo:', resultEntry.usageInfo);
 
@@ -3038,7 +3316,7 @@
             }
         }
 
-        async function executeAndMeasureRequest(apiUrl, fetchOptions, timeout, promptLength) {
+        async function executeAndMeasureRequest(apiUrl, fetchOptions, timeout, promptLength, promptTokenEstimate = null, networkLatencyMs = 0, networkLatencySampleCount = 0) {
 
             const startTime = performance.now();
             let firstTokenTime = null;
@@ -3051,6 +3329,10 @@
             let serverPrefillTimeMs = null; //  服务器返回的prefill真实处理时间
             let serverDecodeTimeMs = null;  //  服务器返回的decode真实处理时间
             let usageInfo = null; // 保存完整的usage对象用于详情展示
+
+            if (hasPositiveNumber(promptTokenEstimate)) {
+                actualPromptTokensFromUsage = promptTokenEstimate;
+            }
 
             const response = await createFetchPromiseWithRetry(apiUrl, fetchOptions, timeout, 3, 1500);
 
@@ -3105,7 +3387,9 @@
                                 const prompt = usageStats.promptTokens || 0;
 
                                 actualOutputTokensFromUsage = usageStats.outputTokens;
-                                actualPromptTokensFromUsage = usageStats.promptTokens;
+                                if (hasPositiveNumber(usageStats.promptTokens)) {
+                                    actualPromptTokensFromUsage = usageStats.promptTokens;
+                                }
 
                                 // 保存完整的usage对象用于详情展示（包含所有可能的字段）
                                 usageInfo = { ...data.usage };
@@ -3172,7 +3456,9 @@
                                 console.log(`[Usage-Ollama] 找到ollama格式！prompt_eval_count: ${prompt}, eval_count: ${completion}`);
 
                                 actualOutputTokensFromUsage = completion;
-                                actualPromptTokensFromUsage = prompt;
+                                if (hasPositiveNumber(prompt)) {
+                                    actualPromptTokensFromUsage = prompt;
+                                }
 
                                 // 构造usage_info
                                 usageInfo = {
@@ -3350,12 +3636,20 @@
                     timeSource = '端到端测量（含网络延迟）';
                 }
 
+                const latencyAdjustmentMs = hasPositiveNumber(networkLatencyMs) ? networkLatencyMs : 0;
+                const clientPrefillTimeMs = Math.max((firstTokenTime - startTime) - latencyAdjustmentMs, 1);
+                const clientOutputTimeMs = Math.max(endTime - firstTokenTime, 1);
+                prefillTimeMs = hasPositiveNumber(serverPrefillTimeMs) ? serverPrefillTimeMs : clientPrefillTimeMs;
+                outputTimeMs = hasPositiveNumber(serverDecodeTimeMs) ? serverDecodeTimeMs : clientOutputTimeMs;
+                const prefillTimeSource = hasPositiveNumber(serverPrefillTimeMs) ? 'server' : (latencyAdjustmentMs > 0 ? 'client_latency_adjusted' : 'client');
+                const outputTimeSource = hasPositiveNumber(serverDecodeTimeMs) ? 'server' : 'client';
                 const prefillSpeed = (actualPromptTokens / (prefillTimeMs / 1000));
                 const outputSpeed = receivedTokens > 0 ? (receivedTokens / (outputTimeMs / 1000)) : 0;
 
                 console.log(`[速度统计] 时间来源: ${timeSource}`);
                 console.log(`[速度统计] Prefill: ${prefillSpeed.toFixed(2)} tok/s (${prefillTimeMs.toFixed(2)}ms), Decode: ${outputSpeed.toFixed(2)} tok/s (${outputTimeMs.toFixed(2)}ms, ${receivedTokens} tokens)`);
 
+                console.log(`[速度统计] 时间来源: Prefill=${prefillTimeSource}, Decode=${outputTimeSource}`);
                 const ttftMs = firstTokenTime - startTime;
                 const itlMean = receivedTokens > 1 ? outputTimeMs / (receivedTokens - 1) : 0;
 
@@ -3365,6 +3659,12 @@
                     outputTokens: receivedTokens,
                     outputTimeMs,
                     outputSpeed,
+                    serverPrefillTimeMs,
+                    serverDecodeTimeMs,
+                    prefillTimeSource,
+                    outputTimeSource,
+                    networkLatencyMs: latencyAdjustmentMs,
+                    networkLatencySampleCount,
                     actualPromptTokens,  //  返回实际的prompt token数
                     outputContent: outputContent + reasoningContent,  // 完整输出内容（思考+答案）
                     reasoningContent: reasoningContent,  // 单独的思考内容
@@ -3520,12 +3820,17 @@
 
         // 【修复】测试Ollama接口
         async function testOllama(apiUrl, modelName, testLengths, outputLength, temperature, top_p, presence_penalty, frequency_penalty, concurrency, timeout, maxLength) {
+            const latencySamples = [];
+            let promptCalibration = null;
             if (testLengths.length > 0) {
-                await sendWarmupRequest(apiUrl, 'ollama', modelName, timeout);
+                promptCalibration = await sendWarmupRequest(apiUrl, 'ollama', modelName, timeout);
+                await collectNetworkLatencySample(latencySamples, apiUrl, 'ollama', modelName, timeout);
+                await collectNetworkLatencySample(latencySamples, apiUrl, 'ollama', modelName, timeout);
             }
 
             for (let length of testLengths) {
                 if (!isTestingRunning) break;
+                const networkLatencyMs = await collectNetworkLatencySample(latencySamples, apiUrl, 'ollama', modelName, timeout);
 
                 // F12控制台日志
                 console.log(`[Test] 准备测试提示词长度: ${length}`);
@@ -3538,6 +3843,10 @@
                     cells.push(cell);
                     row.appendChild(cell);
                 }
+
+                const requestedPromptLength = length;
+                const resolvedPromptLength = getResolvedPromptLength(length);
+                length = resolvedPromptLength;
 
                 cells[0].textContent = length;
                 cells[1].textContent = translations[currentLang].msgTesting;
@@ -3552,6 +3861,7 @@
 
                 let resultEntry = {
                     promptLength: length,
+                    requestedPromptLength: requestedPromptLength,
                     ttftMs: 'N/A',
                     prefillTimeMs: 'N/A',
                     prefillSpeed: 'N/A',
@@ -3571,13 +3881,15 @@
                 let firstPrompt = ''; // 保存第一个请求的prompt用于详情展示
 
                 for (let i = 0; i < concurrency; i++) {
-                    const prompt = generatePrompt(length, 'ollama', i + 1);
+                    const generationPromptLength = getCalibratedGenerationPromptLength(length, promptCalibration);
+                    const prompt = generatePrompt(generationPromptLength, 'ollama', i + 1);
+                    const promptTokenEstimate = applyPromptCalibration(estimatePromptTokensForRequest(prompt), promptCalibration);
                     if (i === 0) firstPrompt = prompt; // 保存第一个prompt
 
                     const requestBody = {
                         "model": modelName,
                         "messages": [
-                            { "role": "system", "content": "You are a helpful assistant." },
+                            { "role": "system", "content": DEFAULT_SYSTEM_PROMPT },
                             { "role": "user", "content": prompt }
                         ],
                         "options": {
@@ -3600,7 +3912,7 @@
                     };
 
                     const fetchPromise = createFetchPromiseWithRetry(apiUrl, fetchOptions, timeout, 3, 1500);
-                    requests.push(fetchPromise);
+                    requests.push(fetchPromise.then(response => ({ response, promptTokenEstimate })));
                 }
 
                 try {
@@ -3609,13 +3921,14 @@
                     let failedMessages = [];
 
                     for (const result of responses) {
-                        if (result.status === 'fulfilled' && result.value.ok) {
-                            processPromises.push(processOllamaResponse(result.value, length));
+                        if (result.status === 'fulfilled' && result.value.response?.ok) {
+                            processPromises.push(processOllamaResponse(result.value.response, length, result.value.promptTokenEstimate, networkLatencyMs, latencySamples.length));
                         } else {
                             if (result.status === 'rejected') {
                                 failedMessages.push(result.reason.message);
                             } else {
-                                failedMessages.push(`HTTP ${result.value.status}`);
+                                const response = result.value?.response || result.value;
+                                failedMessages.push(`HTTP ${response?.status}`);
                             }
                         }
                     }
@@ -3636,9 +3949,7 @@
                         throw new Error(`${translations[currentLang].msgAllRequestsFailed}: ${failedMessages.join(', ')}`);
                     }
 
-                    const avgPrefillTimeMs = concurrencyResults.reduce((sum, res) => sum + res.prefillTimeMs, 0) / concurrencyResults.length;
                     const avgOutputTokens = concurrencyResults.reduce((sum, res) => sum + res.outputTokens, 0) / concurrencyResults.length;
-                    const avgOutputTimeMs = concurrencyResults.reduce((sum, res) => sum + res.outputTimeMs, 0) / concurrencyResults.length;
 
                     const avgTtftMs = concurrencyResults.reduce((sum, res) => sum + res.ttftMs || 0, 0) / concurrencyResults.length;
                     const avgItlMean = concurrencyResults.reduce((sum, res) => sum + res.itlMean || 0, 0) / concurrencyResults.length;
@@ -3652,10 +3963,11 @@
 
                     // ✨ Ollama 特殊处理：使用服务器返回的真实处理时间
                     // 对于并发请求，总吞吐 = 所有token数 / 最长的处理时间（因为请求是并发的）
-                    const maxPrefillDurationMs = Math.max(...concurrencyResults.map(r => r.serverPrefillDurationMs || r.prefillTimeMs));
-                    const maxOutputDurationMs = Math.max(...concurrencyResults.map(r => r.serverOutputDurationMs || r.outputTimeMs));
-                    const totalPromptTokens = concurrencyResults.reduce((sum, r) => sum + r.actualPromptTokens, 0);
-                    const totalOutputTokens = concurrencyResults.reduce((sum, r) => sum + r.outputTokens, 0);
+                    const aggregateMetrics = calculateAggregateThroughputMetrics(concurrencyResults);
+                    const totalPromptTokens = aggregateMetrics.totalPromptTokens;
+                    const totalOutputTokens = aggregateMetrics.totalOutputTokens;
+                    const maxPrefillDurationMs = aggregateMetrics.prefillDurationMs;
+                    const maxOutputDurationMs = aggregateMetrics.decodeDurationMs;
                     const totalPrefillSpeed = maxPrefillDurationMs > 0 ? (totalPromptTokens / (maxPrefillDurationMs / 1000)) : 0;
                     const totalOutputSpeed = maxOutputDurationMs > 0 ? (totalOutputTokens / (maxOutputDurationMs / 1000)) : 0;
 
@@ -3683,15 +3995,20 @@
 
                     resultEntry = {
                         promptLength: actualPromptLength, //  修复：使用实际token数
-                        prefillTimeMs: avgPrefillTimeMs.toFixed(2),
+                        requestedPromptLength: length,
+                        prefillTimeMs: maxPrefillDurationMs.toFixed(2),
                         prefillSpeed: totalPrefillSpeed.toFixed(2),
                         outputTokens: avgOutputTokens.toFixed(0),
-                        outputTimeMs: avgOutputTimeMs.toFixed(2),
+                        outputTimeMs: maxOutputDurationMs.toFixed(2),
                         outputSpeed: totalOutputSpeed.toFixed(2),
                         status: translations[currentLang].statusSuccess,
                         concurrency: concurrency,
                         avgTtftMs: avgTtftMs.toFixed(2),
                         avgItlMean: avgItlMean.toFixed(2),
+                        aggregatePrefillSource: aggregateMetrics.prefillSource,
+                        aggregateOutputSource: aggregateMetrics.decodeSource,
+                        networkLatencyMs: networkLatencyMs > 0 ? networkLatencyMs.toFixed(2) : 'N/A',
+                        networkLatencySampleCount: latencySamples.length,
                         // 保存并发详情（用于P50/P90/P95统计）
                         concurrentDetails: concurrencyResults.map(res => ({
                             prefillTimeMs: res.prefillTimeMs,
@@ -3700,7 +4017,14 @@
                             outputTimeMs: res.outputTimeMs,
                             outputSpeed: res.outputSpeed,
                             ttftMs: res.ttftMs,
-                            itlMean: res.itlMean
+                            itlMean: res.itlMean,
+                            actualPromptTokens: res.actualPromptTokens,
+                            serverPrefillTimeMs: res.serverPrefillTimeMs ?? res.serverPrefillDurationMs,
+                            serverDecodeTimeMs: res.serverDecodeTimeMs ?? res.serverOutputDurationMs,
+                            prefillTimeSource: res.prefillTimeSource,
+                            outputTimeSource: res.outputTimeSource,
+                            networkLatencyMs: res.networkLatencyMs,
+                            networkLatencySampleCount: res.networkLatencySampleCount
                         })),
                         // 详情数据：保存第一个请求的prompt和output
                         promptText: firstPrompt,
@@ -3719,6 +4043,9 @@
                         },
                         timestamp: new Date().toISOString()
                     };
+
+                    resultEntry.promptLength = length;
+                    resultEntry.requestedPromptLength = requestedPromptLength;
 
                     console.log('[Debug] Ollama resultEntry.usageInfo:', resultEntry.usageInfo);
 
@@ -3767,7 +4094,7 @@
             }
         }
 
-        async function processOllamaResponse(response, promptLength) {
+        async function processOllamaResponse(response, promptLength, promptTokenEstimate = null, networkLatencyMs = 0, networkLatencySampleCount = 0) {
 
             if (!response.ok) {
                 const errorText = await response.text();
@@ -3793,7 +4120,7 @@
             const outputDurationMs = Math.max(data.eval_duration / 1_000_000, 1); // ns to ms, 最小 1ms
 
             //  Ollama返回的实际prompt token数
-            const actualPromptTokens = data.prompt_eval_count || promptLength;
+            const actualPromptTokens = data.prompt_eval_count || (hasPositiveNumber(promptTokenEstimate) ? promptTokenEstimate : promptLength);
 
             console.log(`[Ollama Token统计] prompt_eval_count: ${actualPromptTokens}, eval_count: ${actualOutputTokens}, prompt_eval_duration: ${data.prompt_eval_duration}ns`);
 
@@ -3814,6 +4141,8 @@
             console.log('[Debug] Ollama usageInfo:', JSON.stringify(usageInfo, null, 2));
 
             return {
+                serverPrefillTimeMs: prefillDurationMs,
+                serverDecodeTimeMs: outputDurationMs,
                 prefillTimeMs: prefillDurationMs,
                 prefillSpeed: prefillSpeed,
                 outputTokens: actualOutputTokens,
@@ -3828,6 +4157,10 @@
                 // 添加虚拟时间戳（Ollama不是流式，但需要兼容并发吞吐计算）
                 serverPrefillDurationMs: prefillDurationMs,  // 服务器返回的真实prefill时间
                 serverOutputDurationMs: outputDurationMs,     // 服务器返回的真实output时间
+                prefillTimeSource: 'server',
+                outputTimeSource: 'server',
+                networkLatencyMs: hasPositiveNumber(networkLatencyMs) ? networkLatencyMs : 0,
+                networkLatencySampleCount,
                 ttftMs: prefillDurationMs,
                 itlMean: actualOutputTokens > 1 ? outputDurationMs / (actualOutputTokens - 1) : 0
             };
@@ -6134,14 +6467,13 @@
                     detailCount
                 );
                 const explicitSuccessful = parseInt(point?.successful, 10);
-                const measured = point?.prefillSpeed !== 'N/A' && point?.outputSpeed !== 'N/A';
-                const successfulCandidates = [
-                    explicitSuccessful,
-                    statusStats.successful,
-                    detailCount,
-                    measured ? 1 : 0
-                ].filter(value => Number.isFinite(value) && value >= 0);
-                const successful = successfulCandidates.length > 0 ? Math.min(concurrency, Math.max(...successfulCandidates)) : 0;
+                const hasExactExplicitSuccessful = Number.isFinite(explicitSuccessful)
+                    && (detailCount > 0 || statusStats.successful !== null || explicitSuccessful === 0 || explicitSuccessful > 1 || explicitSuccessful === concurrency);
+                const successfulCandidates = [];
+                if (hasExactExplicitSuccessful) successfulCandidates.push(explicitSuccessful);
+                if (statusStats.successful !== null) successfulCandidates.push(statusStats.successful);
+                if (detailCount > 0) successfulCandidates.push(detailCount);
+                const successful = successfulCandidates.length > 0 ? Math.min(concurrency, Math.max(...successfulCandidates)) : null;
                 return { concurrency, successful, concurrentDetails };
             }
             window.doUpload = async function () {
@@ -6278,7 +6610,7 @@
                                 avg_ttft_ms: ttft || 0,
                                 avg_itl_mean: itl || 0,
                                 concurrency: statusStats.concurrency,
-                                successful: statusStats.successful ?? 1
+                                successful: statusStats.successful
                             });
                         }
                         if (!pts.length) continue;

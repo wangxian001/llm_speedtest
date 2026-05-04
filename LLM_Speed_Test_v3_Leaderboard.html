@@ -3509,14 +3509,20 @@
                 if (detailSuccessCount > 0) {
                     successful = Math.max(successful ?? 0, detailSuccessCount);
                 }
-                if (successful === null) {
-                    successful = (Number.isFinite(prefillSpeed) || Number.isFinite(outputSpeed)) ? 1 : 0;
+                const hasMeasuredSpeed = Number.isFinite(prefillSpeed) || Number.isFinite(outputSpeed);
+                const inferredLegacySingleSuccess = hasStoredSuccessful
+                    && detailSuccessCount === 0
+                    && pointConcurrency > 1
+                    && successRaw === 1
+                    && hasMeasuredSpeed;
+                if (successful === null || inferredLegacySingleSuccess) {
+                    successful = hasMeasuredSpeed ? pointConcurrency : 0;
                 }
                 successful = Math.max(0, Math.min(pointConcurrency, Math.round(successful)));
-                const successCountIsExact = detailSuccessCount > 0
+                const successCountIsExact = !inferredLegacySingleSuccess && (detailSuccessCount > 0
                     || pointConcurrency === 1
                     || (Number.isFinite(successRaw) && (successRaw === 0 || successRaw > 1 || successRaw === pointConcurrency))
-                    || (!hasStoredSuccessful && pointConcurrency === 1);
+                    || (!hasStoredSuccessful && pointConcurrency === 1));
 
                 return {
                     ...item,

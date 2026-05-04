@@ -3,6 +3,7 @@ LLM Speed Test Backend
 使用Python绕过浏览器并发限制，支持真正的高并发测试
 """
 import asyncio
+import math
 import time
 import json
 import random
@@ -87,6 +88,32 @@ import os
 from datetime import datetime
 
 current_port = 18000
+
+
+def redact_sensitive_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    """Return a copy of headers safe for debug logging."""
+    sensitive_names = {"authorization", "apikey", "x-api-key"}
+    redacted = dict(headers or {})
+    for key, value in list(redacted.items()):
+        if key.lower() not in sensitive_names:
+            continue
+        if not isinstance(value, str):
+            redacted[key] = "***"
+        elif len(value) > 16:
+            redacted[key] = f"{value[:8]}...{value[-4:]}"
+        else:
+            redacted[key] = "***"
+    return redacted
+
+
+def redact_sensitive_text(text: str) -> str:
+    """Redact credentials and provider account identifiers in debug/error text."""
+    if not text:
+        return text
+    redacted = re.sub(r'(Bearer\s+)[A-Za-z0-9._~+/=-]+', r'\1<redacted>', text)
+    redacted = re.sub(r'sk-[A-Za-z0-9._~+/=-]{12,}', '<redacted_api_key>', redacted)
+    redacted = re.sub(r'("user_id"\s*:\s*")[^"]+(")', r'\1<redacted>\2', redacted)
+    return redacted
 
 
 def resolve_model_catalog_endpoint(api_url: str) -> tuple[Optional[str], bool]:
@@ -191,7 +218,7 @@ class ResultPoint(BaseModel):
     avg_itl_mean: Optional[float] = None
     avg_itl_std: Optional[float] = None
     concurrency: int = 1
-    successful: int = 1
+    successful: Optional[int] = None
     boundary_source: Optional[str] = None
     concurrent_details: Optional[List[Dict]] = None
 
@@ -637,20 +664,71 @@ class TestConfig(BaseModel):
     frequency_penalty: float = 0.0
 
 
+def _is_cjk_char(char: str) -> bool:
+    return (
+        "\u4e00" <= char <= "\u9fff"
+        or "\u3400" <= char <= "\u4dbf"
+        or "\u3040" <= char <= "\u30ff"
+        or "\uac00" <= char <= "\ud7af"
+    )
+
+
+def _is_ascii_word_char(char: str) -> bool:
+    return char.isascii() and (char.isalnum() or char == "_")
+
+
+def _estimate_ascii_run_tokens(run: str) -> int:
+    """Count a plain ASCII word/number run using the shared lightweight tokenizer."""
+    if not run:
+        return 0
+
+    # Common English words are usually one token in modern BPE tokenizers. Very long
+    # unbroken runs are treated as multiple tokens so random IDs still have weight.
+    return max(1, math.ceil(len(run) / 12))
+
+
+def estimate_token_weight(text: str) -> float:
+    """Compatibility wrapper for the shared token estimator."""
+    return float(estimate_token_count(text))
+
+
 def estimate_token_count(text: str) -> int:
-    """估算文本的token数量（当API不返回usage时使用）"""
+    """Estimate tokens with one shared lightweight tokenizer heuristic.
+
+    The benchmark cannot depend on every model-specific tokenizer. This heuristic
+    intentionally mirrors the browser implementation: common ASCII word runs count
+    as one token, long unbroken ASCII runs are split, CJK characters count one by
+    one, whitespace is ignored, and punctuation/symbols count as one token.
+    """
     if not text or len(text) == 0:
         return 0
 
-    # 统计中文字符
-    chinese_chars = len([c for c in text if '\u4e00' <= c <= '\u9fa5'])
-    # 其他字符
-    other_chars = len(text) - chinese_chars
+    token_count = 0
+    index = 0
+    text_length = len(text)
 
-    # 粗略估算：中文约1.5字符=1token，英文约4字符=1token
-    estimated_tokens = round(chinese_chars / 1.5 + other_chars / 4)
+    while index < text_length:
+        char = text[index]
+        if char.isspace():
+            index += 1
+            continue
 
-    return max(1, estimated_tokens)
+        if _is_cjk_char(char):
+            token_count += 1
+            index += 1
+            continue
+
+        if _is_ascii_word_char(char):
+            start = index
+            while index < text_length and _is_ascii_word_char(text[index]):
+                index += 1
+            token_count += _estimate_ascii_run_tokens(text[start:index])
+            continue
+
+        token_count += 1
+        index += 1
+
+    return max(1, token_count)
 
 
 def _coerce_int(value: Any) -> Optional[int]:
@@ -776,28 +854,215 @@ def calculate_dynamic_timeout(prompt_length: int, base_timeout: int) -> int:
         return base_timeout
 
 
+DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+DEFAULT_BENCHMARK_SUFFIX = (
+    "\nBased on the words above, write a short philosophical essay discussing "
+    "the meaning of existence, the nature of consciousness, and humanity's "
+    "place in the universe. Use clear, coherent sentences."
+)
+
+
+ASCII_FILLER_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
+PROMPT_TOKEN_WORDS = [
+    word for word in (
+        "a", "the", "and", "of", "to", "in", "is", "it", "that", "for", "with", "as",
+        "on", "by", "from", "this", "be", "are", "or", "not", "we", "you", "they",
+        "can", "will", "if", "all", "one", "time", "world", "life", "work", "data",
+        "model", "token", "text", "idea", "mind", "story", "light", "space", "future",
+        "human", "system", "simple", "clear", "reason", "change", "value", "truth",
+    )
+    if estimate_token_count(word) == 1
+]
+SHORT_PROMPT_MAX_LENGTH = 46
+BENCHMARK_SUFFIX_TOKEN_LENGTH = SHORT_PROMPT_MAX_LENGTH + 1
+
+
+def get_resolved_prompt_length(length: int) -> int:
+    return max(int(length), 1)
+
+
+def build_ascii_filler(char_count: int, seed: int = 0) -> str:
+    offset = max(seed, 0) % len(ASCII_FILLER_CHARS)
+    return "".join(
+        ASCII_FILLER_CHARS[(offset + i) % len(ASCII_FILLER_CHARS)]
+        for i in range(max(char_count, 0))
+    )
+
+
+def build_token_word_sequence(token_count: int, seed: int = 0) -> str:
+    """Build text that has exactly token_count tokens under the shared heuristic."""
+    target_token_count = max(int(token_count), 0)
+    if target_token_count <= 0:
+        return ""
+
+    rng = random.Random(time.time_ns() ^ (seed * 1_000_003))
+    words = [
+        PROMPT_TOKEN_WORDS[rng.randrange(len(PROMPT_TOKEN_WORDS))]
+        for _ in range(target_token_count)
+    ]
+    return " ".join(words)
+
+
+def generate_short_prompt(length: int, seed: int = 0) -> str:
+    """Generate a short prompt without the benchmark essay suffix."""
+    target_prompt_length = get_resolved_prompt_length(length)
+    return build_token_word_sequence(target_prompt_length, seed)
+
+
 def generate_prompt(length: int, seed: int = 0) -> str:
-    """生成随机prompt，避免cache命中"""
-    words = []
-    
-    # 添加唯一前缀（并发测试时避免cache）
-    if seed > 0:
-        words.append(f"[Request-{seed}-{int(time.time() * 1000)}]")
-    
-    # 随机选择单词
-    for _ in range(length - 20):
-        words.append(random.choice(WORD_LIST))
-    
-    prompt = " ".join(words)
-    prompt += "\nBased on the words above, write a short philosophical essay discussing the meaning of existence, the nature of consciousness, and humanity's place in the universe. Use clear, coherent sentences."
-    
-    return prompt
+    """Generate a randomized prompt whose final estimated length matches the target semantics."""
+    target_prompt_length = get_resolved_prompt_length(length)
+    if target_prompt_length <= SHORT_PROMPT_MAX_LENGTH:
+        return generate_short_prompt(target_prompt_length, seed)
+
+    suffix_text = DEFAULT_BENCHMARK_SUFFIX.strip()
+    suffix_tokens = estimate_token_count(suffix_text)
+    prefix_token_count = max(target_prompt_length - suffix_tokens, 0)
+    prefix_text = build_token_word_sequence(prefix_token_count, seed)
+
+    if prefix_text:
+        return prefix_text + "\n" + suffix_text
+    return suffix_text
+
+
+def estimate_prompt_tokens_for_messages(prompt_text: str, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> int:
+    """Estimate total prompt tokens for the system + user messages."""
+    total_tokens = 0
+    if system_prompt:
+        total_tokens += estimate_token_count(system_prompt)
+    total_tokens += estimate_token_count(prompt_text)
+    return max(1, total_tokens)
+
+
+def build_prompt_calibration(prompt_text: str, actual_prompt_tokens: Optional[int]) -> Optional[Dict[str, Any]]:
+    """Build a one-sample calibration from warmup usage, when the provider returns it."""
+    if not _has_positive_number(actual_prompt_tokens):
+        return None
+
+    estimated_prompt_tokens = estimate_prompt_tokens_for_messages(prompt_text)
+    token_offset = int(actual_prompt_tokens) - estimated_prompt_tokens
+    token_ratio = int(actual_prompt_tokens) / max(estimated_prompt_tokens, 1)
+    return {
+        "source": "warmup_usage",
+        "estimated_prompt_tokens": estimated_prompt_tokens,
+        "actual_prompt_tokens": int(actual_prompt_tokens),
+        "token_offset": token_offset,
+        "token_ratio": token_ratio,
+    }
+
+
+def apply_prompt_calibration(estimated_prompt_tokens: int, calibration: Optional[Dict[str, Any]]) -> int:
+    """Apply warmup-derived fixed overhead to a local prompt token estimate."""
+    if not calibration:
+        return max(int(estimated_prompt_tokens or 0), 1)
+    token_offset = calibration.get("token_offset")
+    if not isinstance(token_offset, (int, float)):
+        return max(int(estimated_prompt_tokens or 0), 1)
+    return max(int(round(estimated_prompt_tokens + token_offset)), 1)
+
+
+def get_calibrated_generation_prompt_length(length: int, calibration: Optional[Dict[str, Any]] = None) -> int:
+    """Choose a local user-prompt length that should land closer to the requested API prompt tokens."""
+    resolved_length = get_resolved_prompt_length(length)
+    if not calibration:
+        return resolved_length
+
+    token_offset = calibration.get("token_offset")
+    if not isinstance(token_offset, (int, float)):
+        return resolved_length
+
+    if resolved_length <= SHORT_PROMPT_MAX_LENGTH:
+        return resolved_length
+
+    system_tokens = estimate_token_count(DEFAULT_SYSTEM_PROMPT)
+    calibrated_user_length = int(round(resolved_length - system_tokens - token_offset))
+    return max(BENCHMARK_SUFFIX_TOKEN_LENGTH, calibrated_user_length)
+
+
+def estimate_generated_prompt_tokens(
+    length: int,
+    seed: int = 1,
+    calibration: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Estimate actual API prompt tokens after applying optional warmup calibration."""
+    generation_length = get_calibrated_generation_prompt_length(length, calibration)
+    return apply_prompt_calibration(
+        estimate_prompt_tokens_for_messages(generate_prompt(generation_length, seed)),
+        calibration,
+    )
+
+
+def _has_positive_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and value > 0
+
+
+def calculate_aggregate_throughput_metrics(results: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate concurrent throughput with server timings when available."""
+    if not results:
+        return {
+            "prefill_time_ms": 0.0,
+            "output_time_ms": 0.0,
+            "prefill_speed": 0.0,
+            "output_speed": 0.0,
+            "prefill_source": "client",
+            "output_source": "client",
+        }
+
+    total_prompt_tokens = sum(r.get("prompt_tokens") or 0 for r in results)
+    total_output_tokens = sum(r.get("output_tokens") or 0 for r in results)
+
+    use_server_prefill = all(_has_positive_number(r.get("server_prefill_time_ms")) for r in results)
+    if use_server_prefill:
+        prefill_time_ms = max(r["server_prefill_time_ms"] for r in results)
+        prefill_source = "server"
+    else:
+        min_start = min(r.get("start_timestamp") or 0 for r in results)
+        max_boundary = max(
+            r.get("first_token_timestamp")
+            or r.get("boundary_timestamp")
+            or r.get("end_timestamp")
+            or min_start
+            for r in results
+        )
+        average_network_latency_ms = get_average_network_latency_ms([
+            r.get("network_latency_ms") or 0 for r in results
+        ])
+        prefill_time_ms = max(((max_boundary - min_start) * 1000) - average_network_latency_ms, 1)
+        prefill_source = "client_latency_adjusted" if average_network_latency_ms > 0 else "client"
+
+    use_server_output = all(_has_positive_number(r.get("server_decode_time_ms")) for r in results)
+    if use_server_output:
+        output_time_ms = max(r["server_decode_time_ms"] for r in results)
+        output_source = "server"
+    else:
+        min_decode_start = min(
+            r.get("first_token_timestamp")
+            or r.get("boundary_timestamp")
+            or r.get("start_timestamp")
+            or 0
+            for r in results
+        )
+        max_end = max(r.get("end_timestamp") or min_decode_start for r in results)
+        output_time_ms = max((max_end - min_decode_start) * 1000, 1)
+        output_source = "client"
+
+    prefill_speed = total_prompt_tokens / (prefill_time_ms / 1000) if prefill_time_ms > 0 else 0.0
+    output_speed = total_output_tokens / (output_time_ms / 1000) if output_time_ms > 0 else 0.0
+
+    return {
+        "prefill_time_ms": prefill_time_ms,
+        "output_time_ms": output_time_ms,
+        "prefill_speed": prefill_speed,
+        "output_speed": output_speed,
+        "prefill_source": prefill_source,
+        "output_source": output_source,
+    }
 
 
 def generate_warmup_prompt() -> str:
-    """Generate a short randomized warmup prompt to avoid prefix cache hits."""
-    nonce = f"{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
-    return f"Warmup request {nonce}. Reply with one short word only."
+    """Generate a short randomized warmup prompt using the benchmark tokenizer path."""
+    seed = random.randint(1, 1_000_000)
+    return generate_prompt(96, seed=seed)
 
 
 async def send_warmup_request(
@@ -808,7 +1073,7 @@ async def send_warmup_request(
     timeout: int,
     temperature: float,
     top_p: float,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     """Send a short warmup request and wait for it to finish before benchmarking."""
     warmup_prompt = generate_warmup_prompt()
     warmup_timeout = max(timeout, 15000)
@@ -821,7 +1086,7 @@ async def send_warmup_request(
         payload = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
                 {"role": "user", "content": warmup_prompt},
             ],
             "max_tokens": 8,
@@ -834,7 +1099,7 @@ async def send_warmup_request(
         payload = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
                 {"role": "user", "content": warmup_prompt},
             ],
             "options": {
@@ -851,6 +1116,7 @@ async def send_warmup_request(
         flush=True,
     )
 
+    calibration = None
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(api_url, headers=headers, json=payload)
@@ -859,16 +1125,152 @@ async def send_warmup_request(
                 raise RuntimeError(
                     build_http_error_message(api_url, model_name, response.status_code, response_bytes)
                 )
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                data = {}
+            actual_prompt_tokens = None
+            if isinstance(data, dict):
+                if isinstance(data.get("usage"), dict):
+                    actual_prompt_tokens = extract_usage_token_stats(data["usage"]).get("prompt_tokens")
+                elif data.get("prompt_eval_count") is not None:
+                    actual_prompt_tokens = _coerce_int(data.get("prompt_eval_count"))
+            calibration = build_prompt_calibration(warmup_prompt, actual_prompt_tokens)
         print("[Warmup] Warmup request completed.", flush=True)
+        if calibration:
+            print(
+                f"[Warmup] Prompt calibration: estimated={calibration['estimated_prompt_tokens']}, "
+                f"actual={calibration['actual_prompt_tokens']}, "
+                f"offset={calibration['token_offset']}, ratio={calibration['token_ratio']:.3f}",
+                flush=True,
+            )
     except Exception as exc:
         print(f"[Warmup] Warmup request failed: {exc}", flush=True)
 
     await asyncio.sleep(0.8)
+    return calibration
+
+
+def get_average_network_latency_ms(latency_samples: list[float]) -> float:
+    valid_samples = [sample for sample in latency_samples if isinstance(sample, (int, float)) and sample > 0]
+    if not valid_samples:
+        return 0.0
+    if len(valid_samples) >= 3:
+        sorted_samples = sorted(valid_samples)
+        valid_samples = sorted_samples[1:-1]
+    return sum(valid_samples) / len(valid_samples)
+
+
+def build_latency_probe_payload(
+    api_type: str,
+    model_name: str,
+    temperature: float,
+    top_p: float,
+) -> Dict[str, Any]:
+    nonce = f"{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
+    prompt = f"Latency probe {nonce}. Reply ok."
+    if api_type == "openai":
+        return {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": 1,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": False,
+        }
+
+    return {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "options": {
+            "num_predict": 1,
+            "temperature": temperature,
+            "top_p": top_p,
+        },
+        "stream": False,
+    }
+
+
+async def measure_network_latency_sample(
+    api_url: str,
+    api_key: str,
+    api_type: str,
+    model_name: str,
+    timeout: int,
+    temperature: float,
+    top_p: float,
+) -> Optional[Dict[str, Any]]:
+    probe_timeout = min(max((timeout or 0) / 1000.0, 3.0), 8.0)
+    headers: Dict[str, str] = {}
+    if api_type == "openai" and api_key and api_key.strip():
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        async with httpx.AsyncClient(timeout=probe_timeout, verify=False) as client:
+            start = time.perf_counter()
+            response = await client.options(api_url, headers=headers)
+            _ = response.content
+            latency_ms = (time.perf_counter() - start) * 1000
+            return {"latency_ms": latency_ms, "probe_type": f"OPTIONS {response.status_code}"}
+    except Exception as exc:
+        print(f"[Latency] OPTIONS latency probe failed, fallback to tiny completion: {exc}", flush=True)
+
+    headers = {"Content-Type": "application/json", **headers}
+    payload = build_latency_probe_payload(api_type, model_name, temperature, top_p)
+    try:
+        async with httpx.AsyncClient(timeout=probe_timeout, verify=False) as client:
+            start = time.perf_counter()
+            response = await client.post(api_url, headers=headers, json=payload)
+            _ = response.content
+            latency_ms = (time.perf_counter() - start) * 1000
+            return {"latency_ms": latency_ms, "probe_type": f"tiny_completion {response.status_code}"}
+    except Exception as exc:
+        print(f"[Latency] latency probe failed: {exc}", flush=True)
+        return None
+
+
+async def collect_network_latency_sample(
+    latency_samples: list[float],
+    api_url: str,
+    api_key: str,
+    api_type: str,
+    model_name: str,
+    timeout: int,
+    temperature: float,
+    top_p: float,
+) -> float:
+    sample = await measure_network_latency_sample(
+        api_url=api_url,
+        api_key=api_key,
+        api_type=api_type,
+        model_name=model_name,
+        timeout=timeout,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    if sample and isinstance(sample.get("latency_ms"), (int, float)) and sample["latency_ms"] > 0:
+        latency_samples.append(float(sample["latency_ms"]))
+        if len(latency_samples) > 20:
+            del latency_samples[0]
+        print(
+            f"[Latency] {sample['probe_type']}: {sample['latency_ms']:.2f}ms, "
+            f"avg={get_average_network_latency_ms(latency_samples):.2f}ms, "
+            f"samples={len(latency_samples)}",
+            flush=True,
+        )
+
+    return get_average_network_latency_ms(latency_samples)
 
 
 def build_http_error_message(api_url: str, model_name: str, status_code: int, error_bytes: bytes) -> str:
     """Build a more actionable HTTP error message for common provider quirks."""
-    error_text = error_bytes.decode(errors="replace")
+    error_text = redact_sensitive_text(error_bytes.decode(errors="replace"))
     error_msg = f"HTTP {status_code}: {error_text}"
 
     host = urlparse(api_url).netloc.lower()
@@ -901,13 +1303,23 @@ async def execute_single_request(
     presence_penalty: float,
     frequency_penalty: float,
     seed: int = 0,
+    network_latency_ms: float = 0.0,
+    network_latency_sample_count: int = 0,
+    prompt_calibration: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """执行单个测试请求"""
     
-    print(f"[Request] 开始请求 - Prompt长度: {prompt_length}, 输出长度: {output_length}, Seed: {seed}")
-    
+    resolved_prompt_length = get_resolved_prompt_length(prompt_length)
+    generation_prompt_length = get_calibrated_generation_prompt_length(prompt_length, prompt_calibration)
+    print(
+        f"[Request] 开始请求 - Prompt长度: {prompt_length}, "
+        f"目标长度: {resolved_prompt_length}, 输出长度: {output_length}, Seed: {seed}"
+    )
+
     # 使用随机单词生成prompt，避免cache
-    prompt_text = generate_prompt(prompt_length, seed)
+    prompt_text = generate_prompt(generation_prompt_length, seed)
+    local_estimated_prompt_tokens = estimate_prompt_tokens_for_messages(prompt_text)
+    estimated_prompt_tokens = apply_prompt_calibration(local_estimated_prompt_tokens, prompt_calibration)
     
     if api_type == "openai":
         headers = {
@@ -919,7 +1331,7 @@ async def execute_single_request(
         payload = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt_text}
             ],
             "max_tokens": output_length,
@@ -935,7 +1347,7 @@ async def execute_single_request(
         payload = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt_text}
             ],
             "options": {
@@ -966,7 +1378,7 @@ async def execute_single_request(
     try:
         print(f"[Request] 发送请求到 {api_url}", flush=True)
         print(f"[Request] Payload大小预估: {len(json.dumps(payload))} 字节", flush=True)
-        print(f"[Request] Headers: {headers}", flush=True)
+        print(f"[Request] Headers: {redact_sensitive_headers(headers)}", flush=True)
 
         # 配置httpx以支持大payload和长时间请求
         # httpx 0.13.x 使用不同的Timeout API
@@ -1037,7 +1449,8 @@ async def execute_single_request(
                             print(f"[Debug] 完整usage字段: {json.dumps(usage, indent=2)}")
 
                             actual_output_tokens = usage_stats["output_tokens"]
-                            actual_prompt_tokens = usage_stats["prompt_tokens"]
+                            if _has_positive_number(usage_stats["prompt_tokens"]):
+                                actual_prompt_tokens = usage_stats["prompt_tokens"]
                             usage_info = usage.copy()
 
                             # 提取服务器timing (多种可能的字段名)
@@ -1074,7 +1487,8 @@ async def execute_single_request(
                             print(f"[Usage-Ollama] 找到ollama格式！prompt_eval_count: {prompt}, eval_count: {completion}")
 
                             actual_output_tokens = completion
-                            actual_prompt_tokens = prompt
+                            if _has_positive_number(prompt):
+                                actual_prompt_tokens = prompt
 
                             # 构造usage_info
                             usage_info = {
@@ -1231,7 +1645,7 @@ async def execute_single_request(
         token_source = ''
         if actual_prompt_tokens is None or actual_prompt_tokens <= 0:
             # Fallback: 使用prompt_length作为估算（因为我们控制了prompt生成）
-            actual_prompt_tokens = prompt_length
+            actual_prompt_tokens = estimated_prompt_tokens
             print(f"[Token] Prompt估算: {actual_prompt_tokens} (使用设定长度)")
         else:
             print(f"[Token] Prompt来自usage: {actual_prompt_tokens}")
@@ -1267,6 +1681,23 @@ async def execute_single_request(
             print(f"[TimeSource] client timing fallback - Prefill(TTFT): {prefill_time_ms:.2f}ms, Decode: {output_time_ms:.2f}ms, Boundary: {boundary_source}")
             if server_prefill_time_ms or server_decode_time_ms:
                 print(f"[TimeSource] 部分服务器timing可用 - Prefill: {server_prefill_time_ms}ms, Decode: {server_decode_time_ms}ms")
+
+        has_server_prefill_timing = _has_positive_number(server_prefill_time_ms)
+        has_server_decode_timing = _has_positive_number(server_decode_time_ms)
+        latency_adjustment_ms = network_latency_ms if _has_positive_number(network_latency_ms) else 0.0
+        if has_server_prefill_timing or has_server_decode_timing:
+            prefill_time_ms = server_prefill_time_ms if has_server_prefill_timing else max(ttft_ms - latency_adjustment_ms, 1)
+            output_time_ms = server_decode_time_ms if has_server_decode_timing else decode_time_ms
+            prefill_time_source = "server" if has_server_prefill_timing else ("client_latency_adjusted" if latency_adjustment_ms > 0 else "client")
+            output_time_source = "server" if has_server_decode_timing else "client"
+            print(
+                f"[TimeSource] Adjusted per-phase timing - Prefill={prefill_time_source} "
+                f"({prefill_time_ms:.2f}ms), Decode={output_time_source} ({output_time_ms:.2f}ms)"
+            )
+        else:
+            prefill_time_ms = max(ttft_ms - latency_adjustment_ms, 1)
+            prefill_time_source = "client_latency_adjusted" if latency_adjustment_ms > 0 else "client"
+            output_time_source = "client"
 
         # 计算速度 (tokens/second)
         # 使用usage中的token数量，即使没有收到实际内容也计算
@@ -1304,8 +1735,13 @@ async def execute_single_request(
 
         return {
             "success": True,
-            "prompt_length": prompt_length,
+            "prompt_length": resolved_prompt_length,
+            "requested_prompt_length": prompt_length,
+            "generated_prompt_length": generation_prompt_length,
             "prompt_tokens": actual_prompt_tokens,
+            "estimated_prompt_tokens": estimated_prompt_tokens,
+            "local_estimated_prompt_tokens": local_estimated_prompt_tokens,
+            "prompt_calibration": prompt_calibration,
             "output_tokens": actual_output_tokens,
             "ttft_ms": round(ttft_ms, 2),
             "prefill_time_ms": round(prefill_time_ms, 2),
@@ -1317,7 +1753,13 @@ async def execute_single_request(
             "output_content": output_content,
             "reasoning_content": reasoning_content,
             "usage_info": usage_info,
-            "server_timing_used": server_prefill_time_ms is not None,
+            "server_timing_used": server_prefill_time_ms is not None or server_decode_time_ms is not None,
+            "server_prefill_time_ms": round(server_prefill_time_ms, 2) if server_prefill_time_ms is not None else None,
+            "server_decode_time_ms": round(server_decode_time_ms, 2) if server_decode_time_ms is not None else None,
+            "prefill_time_source": prefill_time_source,
+            "output_time_source": output_time_source,
+            "network_latency_ms": round(latency_adjustment_ms, 2),
+            "network_latency_sample_count": network_latency_sample_count,
             "has_streaming_content": first_token_time is not None,  # 是否有实际内容token
             "chunk_count": chunk_count,  # chunk数量
             # 添加绝对时间戳用于并发总吞吐计算
@@ -1341,7 +1783,9 @@ async def execute_single_request(
         return {
             "success": False,
             "error": error_msg,
-            "prompt_length": prompt_length
+            "prompt_length": resolved_prompt_length,
+            "requested_prompt_length": prompt_length,
+            "generated_prompt_length": generation_prompt_length,
         }
     except httpx.HTTPError as e:
         error_msg = f"HTTP错误: {type(e).__name__}: {str(e)}"
@@ -1351,7 +1795,9 @@ async def execute_single_request(
         return {
             "success": False,
             "error": error_msg,
-            "prompt_length": prompt_length
+            "prompt_length": resolved_prompt_length,
+            "requested_prompt_length": prompt_length,
+            "generated_prompt_length": generation_prompt_length,
         }
     except Exception as e:
         error_msg = f"请求异常: {type(e).__name__}: {str(e)}"
@@ -1361,7 +1807,9 @@ async def execute_single_request(
         return {
             "success": False,
             "error": error_msg,
-            "prompt_length": prompt_length
+            "prompt_length": resolved_prompt_length,
+            "requested_prompt_length": prompt_length,
+            "generated_prompt_length": generation_prompt_length,
         }
 
 
@@ -1395,9 +1843,11 @@ async def websocket_test_endpoint(websocket: WebSocket):
         completed = 0
         
         all_results = []
+        latency_samples: list[float] = []
+        prompt_calibration = None
 
         if total_tests > 0:
-            await send_warmup_request(
+            prompt_calibration = await send_warmup_request(
                 api_url=config.api_url,
                 api_key=config.api_key,
                 api_type=config.api_type,
@@ -1407,19 +1857,59 @@ async def websocket_test_endpoint(websocket: WebSocket):
                 top_p=config.top_p,
             )
         
+            await collect_network_latency_sample(
+                latency_samples,
+                config.api_url,
+                config.api_key,
+                config.api_type,
+                config.model_name,
+                config.timeout,
+                config.temperature,
+                config.top_p,
+            )
+            await collect_network_latency_sample(
+                latency_samples,
+                config.api_url,
+                config.api_key,
+                config.api_type,
+                config.model_name,
+                config.timeout,
+                config.temperature,
+                config.top_p,
+            )
+
         for length in test_lengths:
             print(f"\n[Test] ===== 测试提示词长度: {length} ({completed+1}/{total_tests}) =====")
             
+            network_latency_ms = await collect_network_latency_sample(
+                latency_samples,
+                config.api_url,
+                config.api_key,
+                config.api_type,
+                config.model_name,
+                config.timeout,
+                config.temperature,
+                config.top_p,
+            )
+
             await websocket.send_json({
                 "type": "progress",
                 "current": completed,
                 "total": total_tests,
-                "testing_length": length
+                "testing_length": length,
+                "network_latency_ms": round(network_latency_ms, 2),
+                "network_latency_sample_count": len(latency_samples),
             })
 
             # 创建并发任务（每个任务使用不同的seed避免cache）
             # 根据prompt长度动态计算超时时间
-            dynamic_timeout = calculate_dynamic_timeout(length, config.timeout)
+            estimated_prompt_tokens_for_timeout = estimate_generated_prompt_tokens(length, calibration=prompt_calibration)
+            print(
+                f"[PromptEstimate] Requested={length}, estimated_actual_prompt_tokens="
+                f"{estimated_prompt_tokens_for_timeout}",
+                flush=True,
+            )
+            dynamic_timeout = calculate_dynamic_timeout(estimated_prompt_tokens_for_timeout, config.timeout)
 
             tasks = []
             for i in range(config.concurrency):
@@ -1435,6 +1925,9 @@ async def websocket_test_endpoint(websocket: WebSocket):
                     top_p=config.top_p,
                     presence_penalty=config.presence_penalty,
                     frequency_penalty=config.frequency_penalty,
+                    network_latency_ms=network_latency_ms,
+                    network_latency_sample_count=len(latency_samples),
+                    prompt_calibration=prompt_calibration,
                     seed=i + 1,  # 每个并发请求使用不同seed
                 )
                 tasks.append(task)
@@ -1468,10 +1961,18 @@ async def websocket_test_endpoint(websocket: WebSocket):
                 max_prefill_speed = max(r["prefill_speed"] for r in successful_results)
                 max_output_speed = max(r["output_speed"] for r in successful_results)
                 avg_ttft = sum(r["ttft_ms"] for r in successful_results) / len(successful_results)
+                avg_prompt_tokens = sum(r["prompt_tokens"] for r in successful_results) / len(successful_results)
+                aggregate_metrics = calculate_aggregate_throughput_metrics(successful_results)
                 boundary_fallback_count = sum(1 for r in successful_results if r.get("boundary_source") == "first_chunk_fallback")
                 record_tags = ["source:python_backend"]
                 if boundary_fallback_count > 0:
                     record_tags.append("boundary_source:first_chunk_fallback")
+                if aggregate_metrics["prefill_source"] == "server":
+                    record_tags.append("prefill_source:server")
+                elif aggregate_metrics["prefill_source"] == "client_latency_adjusted":
+                    record_tags.append("prefill_source:client_latency_adjusted")
+                if aggregate_metrics["output_source"] == "server":
+                    record_tags.append("decode_source:server")
                 
                 print(f"[Stats] 成功: {len(successful_results)}/{config.concurrency}")
                 print(f"[Stats] 平均 Prefill速度: {avg_prefill_speed:.2f} t/s")
@@ -1480,9 +1981,22 @@ async def websocket_test_endpoint(websocket: WebSocket):
                 print(f"[Stats] Max Decode speed: {max_output_speed:.2f} t/s")
                 print(f"[Stats] 平均 TTFT: {avg_ttft:.2f} ms")
                 
+                print(
+                    f"[Stats] Aggregate Prefill: {aggregate_metrics['prefill_speed']:.2f} t/s "
+                    f"({aggregate_metrics['prefill_time_ms']:.2f}ms, source={aggregate_metrics['prefill_source']})"
+                )
+                print(
+                    f"[Stats] Aggregate Decode: {aggregate_metrics['output_speed']:.2f} t/s "
+                    f"({aggregate_metrics['output_time_ms']:.2f}ms, source={aggregate_metrics['output_source']})"
+                )
+
                 result_summary = {
                     "type": "result",
-                    "prompt_length": length,
+                    "prompt_length": get_resolved_prompt_length(length),
+                    "requested_prompt_length": length,
+                    "network_latency_ms": round(network_latency_ms, 2),
+                    "network_latency_sample_count": len(latency_samples),
+                    "avg_prompt_tokens": round(avg_prompt_tokens, 2),
                     "concurrency": config.concurrency,
                     "successful": len(successful_results),
                     "failed": failed_count,
@@ -1490,6 +2004,12 @@ async def websocket_test_endpoint(websocket: WebSocket):
                     "avg_output_speed": round(avg_output_speed, 2),
                     "max_prefill_speed": round(max_prefill_speed, 2),
                     "max_output_speed": round(max_output_speed, 2),
+                    "aggregate_prefill_time_ms": round(aggregate_metrics["prefill_time_ms"], 2),
+                    "aggregate_output_time_ms": round(aggregate_metrics["output_time_ms"], 2),
+                    "aggregate_prefill_speed": round(aggregate_metrics["prefill_speed"], 2),
+                    "aggregate_output_speed": round(aggregate_metrics["output_speed"], 2),
+                    "aggregate_prefill_source": aggregate_metrics["prefill_source"],
+                    "aggregate_output_source": aggregate_metrics["output_source"],
                     "avg_ttft_ms": round(avg_ttft, 2),
                     "source": "python_backend",
                     "record_tags": record_tags,
@@ -1504,7 +2024,10 @@ async def websocket_test_endpoint(websocket: WebSocket):
                 print(f"[Error] 所有请求失败 - 失败数: {failed_count}")
                 error_result = {
                     "type": "result",
-                    "prompt_length": length,
+                    "prompt_length": get_resolved_prompt_length(length),
+                    "requested_prompt_length": length,
+                    "network_latency_ms": round(network_latency_ms, 2),
+                    "network_latency_sample_count": len(latency_samples),
                     "status": "失败",
                     "error": f"所有 {config.concurrency} 个并发请求都失败了"
                 }

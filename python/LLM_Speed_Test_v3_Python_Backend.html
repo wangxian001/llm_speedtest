@@ -3683,22 +3683,45 @@ async function processOllamaResponse(response, promptLength) {
                 const minStartTime = Math.min(...details.map(r => r.start_timestamp));
                 // 使用first_chunk_timestamp（第一个chunk到达）而不是first_token_timestamp（第一个内容token）
                 const maxFirstChunkTime = Math.max(...details.map(r => r.first_chunk_timestamp || r.first_token_timestamp || r.end_timestamp));
-                const prefillDurationSec = maxFirstChunkTime - minStartTime;
+                let prefillDurationSec = maxFirstChunkTime - minStartTime;
                 const totalPromptTokens = details.reduce((sum, r) => sum + r.prompt_tokens, 0);
-                const totalPrefillSpeed = prefillDurationSec > 0 ? totalPromptTokens / prefillDurationSec : 0;
+                let totalPrefillSpeed = prefillDurationSec > 0 ? totalPromptTokens / prefillDurationSec : 0;
 
                 // Decode: 从最早的first_chunk到最晚的end
                 const minFirstChunkTime = Math.min(...details.map(r => r.first_chunk_timestamp || r.first_token_timestamp || r.start_timestamp));
                 const maxEndTime = Math.max(...details.map(r => r.end_timestamp));
-                const decodeDurationSec = maxEndTime - minFirstChunkTime;
+                let decodeDurationSec = maxEndTime - minFirstChunkTime;
                 const totalOutputTokens = details.reduce((sum, r) => sum + r.output_tokens, 0);
-                const totalOutputSpeed = decodeDurationSec > 0 ? totalOutputTokens / decodeDurationSec : 0;
+                let totalOutputSpeed = decodeDurationSec > 0 ? totalOutputTokens / decodeDurationSec : 0;
 
                 console.log(`[Throughput] Prefill: ${totalPromptTokens} tokens / ${prefillDurationSec.toFixed(3)}s = ${totalPrefillSpeed.toFixed(2)} t/s`);
                 console.log(`[Throughput] Decode: ${totalOutputTokens} tokens / ${decodeDurationSec.toFixed(3)}s = ${totalOutputSpeed.toFixed(2)} t/s`);
 
+                const backendAggregatePrefillSpeed = Number(message.aggregate_prefill_speed);
+                const backendAggregateOutputSpeed = Number(message.aggregate_output_speed);
+                const backendAggregatePrefillTimeMs = Number(message.aggregate_prefill_time_ms);
+                const backendAggregateOutputTimeMs = Number(message.aggregate_output_time_ms);
+                if (Number.isFinite(backendAggregatePrefillSpeed) && backendAggregatePrefillSpeed > 0) {
+                    totalPrefillSpeed = backendAggregatePrefillSpeed;
+                    if (Number.isFinite(backendAggregatePrefillTimeMs) && backendAggregatePrefillTimeMs > 0) {
+                        prefillDurationSec = backendAggregatePrefillTimeMs / 1000;
+                    }
+                }
+                if (Number.isFinite(backendAggregateOutputSpeed) && backendAggregateOutputSpeed > 0) {
+                    totalOutputSpeed = backendAggregateOutputSpeed;
+                    if (Number.isFinite(backendAggregateOutputTimeMs) && backendAggregateOutputTimeMs > 0) {
+                        decodeDurationSec = backendAggregateOutputTimeMs / 1000;
+                    }
+                }
+
+                const resolvedPromptLength = Number.isFinite(Number(message.prompt_length))
+                    ? Number(message.prompt_length)
+                    : Math.round(totalPromptTokens / Math.max(details.length, 1));
+
                 // 计算TTFT和ITL的聚合统计（提前计算，供表格和详情使用）
-                const avgTtftMs = message.avg_ttft_ms || (details.reduce((sum, r) => sum + (r.ttft_ms || 0), 0) / details.length);
+                const avgTtftMs = Number.isFinite(Number(message.avg_ttft_ms))
+                    ? Number(message.avg_ttft_ms)
+                    : (details.reduce((sum, r) => sum + (r.ttft_ms || 0), 0) / details.length);
 
                 // 聚合ITL统计（从所有并发请求中取平均）
                 const itlStatsArray = details.filter(r => r.itl_stats && Object.keys(r.itl_stats).length > 0).map(r => r.itl_stats);
@@ -3709,8 +3732,8 @@ async function processOllamaResponse(response, promptLength) {
                     avgItlStd = (itlStatsArray.reduce((sum, s) => sum + (s.std || 0), 0) / itlStatsArray.length).toFixed(2);
                 }
 
-                cells[0].textContent = message.prompt_length;
-                cells[1].textContent = message.avg_ttft_ms.toFixed(2);
+                cells[0].textContent = resolvedPromptLength;
+                cells[1].textContent = avgTtftMs.toFixed(2);
                 cells[2].textContent = avgItlMean;
 
                 cells[3].textContent = totalPrefillSpeed.toFixed(2);  // 修复：使用基于时间戳的真实总吞吐
@@ -3729,7 +3752,7 @@ async function processOllamaResponse(response, promptLength) {
                 // 如果不保存详情，清理concurrentDetails中的文本内容以节省存储空间
                 // 但保留第一个请求的prompt/output作为示例
                 let concurrentDetailsToSave = message.concurrent_details;
-                const firstPromptSample = message.concurrent_details[0]?.prompt_text || 'a'.repeat(message.prompt_length);
+                const firstPromptSample = message.concurrent_details[0]?.prompt_text || 'a'.repeat(Math.max(resolvedPromptLength, 1));
                 const firstOutputSample = message.concurrent_details[0]?.output_content || '';
                 const firstReasoningSample = message.concurrent_details[0]?.reasoning_content || '';
 
@@ -3742,11 +3765,12 @@ async function processOllamaResponse(response, promptLength) {
 
                 // Prepare result entry for detail view
                 const resultEntry = {
-                    promptLength: message.prompt_length,
-                    prefillTimeMs: message.concurrent_details[0]?.prefill_time_ms.toFixed(2) || 'N/A',
+                    promptLength: resolvedPromptLength,
+                    requestedPromptLength: Number.isFinite(Number(message.requested_prompt_length)) ? Number(message.requested_prompt_length) : resolvedPromptLength,
+                    prefillTimeMs: (prefillDurationSec * 1000).toFixed(2),
                     prefillSpeed: totalPrefillSpeed.toFixed(2),  // 修复：使用总吞吐而不是平均值
-                    outputTokens: message.concurrent_details[0]?.output_tokens || 'N/A',
-                    outputTimeMs: message.concurrent_details[0]?.output_time_ms.toFixed(2) || 'N/A',
+                    outputTokens: details.length > 0 ? Math.round(totalOutputTokens / details.length) : 'N/A',
+                    outputTimeMs: (decodeDurationSec * 1000).toFixed(2),
                     outputSpeed: totalOutputSpeed.toFixed(2),  // 修复：使用总吞吐而不是平均值
                     status: t.statusSuccess,
                     concurrency: message.concurrency,
@@ -7011,14 +7035,13 @@ async function processOllamaResponse(response, promptLength) {
                 detailCount
             );
             const explicitSuccessful = parseInt(point?.successful, 10);
-            const measured = point?.prefillSpeed !== 'N/A' && point?.outputSpeed !== 'N/A';
-            const successfulCandidates = [
-                explicitSuccessful,
-                statusStats.successful,
-                detailCount,
-                measured ? 1 : 0
-            ].filter(value => Number.isFinite(value) && value >= 0);
-            const successful = successfulCandidates.length > 0 ? Math.min(concurrency, Math.max(...successfulCandidates)) : 0;
+            const hasExactExplicitSuccessful = Number.isFinite(explicitSuccessful)
+                && (detailCount > 0 || statusStats.successful !== null || explicitSuccessful === 0 || explicitSuccessful > 1 || explicitSuccessful === concurrency);
+            const successfulCandidates = [];
+            if (hasExactExplicitSuccessful) successfulCandidates.push(explicitSuccessful);
+            if (statusStats.successful !== null) successfulCandidates.push(statusStats.successful);
+            if (detailCount > 0) successfulCandidates.push(detailCount);
+            const successful = successfulCandidates.length > 0 ? Math.min(concurrency, Math.max(...successfulCandidates)) : null;
             return { concurrency, successful, concurrentDetails };
         }
 
@@ -7326,7 +7349,7 @@ async function processOllamaResponse(response, promptLength) {
                             avg_itl_mean: isNaN(itlMean) ? null : itlMean,
                             avg_itl_std: isNaN(itlStd) ? null : itlStd,
                             concurrency: statusStats.concurrency,
-                            successful: statusStats.successful ?? 1,
+                            successful: statusStats.successful,
                             concurrent_details: [] // 历史CSV没有存并发详情，留空
                         });
                     }
