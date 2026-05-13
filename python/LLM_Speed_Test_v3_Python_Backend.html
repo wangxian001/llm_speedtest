@@ -2804,6 +2804,8 @@ async function testOpenAI(apiUrl, modelName, minLength, maxLength, step, outputL
                         console.log(`[Token差异] 预期: ${length}, 实际: ${actualPromptLength}, 差异: ${diff > 0 ? '+' : ''}${diff} (${diffPercent}%)`);
                     }
 
+                    const successfulCount = concurrencyResults.length;
+                    const statusText = `${successfulCount}/${concurrency} ${translations[currentLang].msgConcurrentSuccess}`;
                     resultEntry = {
                         promptLength: actualPromptLength, //  修复：使用实际token数
                         prefillTimeMs: avgPrefillTimeMs.toFixed(2),
@@ -2811,8 +2813,9 @@ async function testOpenAI(apiUrl, modelName, minLength, maxLength, step, outputL
                         outputTokens: avgOutputTokens.toFixed(0),
                         outputTimeMs: avgOutputTimeMs.toFixed(2),
                         outputSpeed: totalOutputSpeed.toFixed(2),
-                        status: translations[currentLang].statusSuccess,
+                        status: statusText,
                         concurrency: concurrency,
+                        successful: successfulCount,
                         // 保存并发详情（用于P50/P90/P95统计）
                         concurrentDetails: concurrencyResults.map(res => ({
                             prefillTimeMs: res.prefillTimeMs,
@@ -2848,7 +2851,7 @@ async function testOpenAI(apiUrl, modelName, minLength, maxLength, step, outputL
                     cells[4].textContent = resultEntry.outputTimeMs;
                     cells[5].textContent = resultEntry.outputSpeed;
                     // 显示部分成功
-                    cells[6].textContent = `${concurrencyResults.length}/${concurrency} ${translations[currentLang].msgConcurrentSuccess}`;
+                    cells[6].textContent = resultEntry.status;
 
                     // 添加详情按钮
                     cells[7].textContent = ''; // 清空占位符
@@ -3786,6 +3789,7 @@ async function processOllamaResponse(response, promptLength) {
                 }
 
                 // Prepare result entry for detail view
+                const statusText = `${message.successful}/${message.concurrency} ${t.msgConcurrentSuccess}`;
                 const resultEntry = {
                     promptLength: resolvedPromptLength,
                     requestedPromptLength: Number.isFinite(Number(message.requested_prompt_length)) ? Number(message.requested_prompt_length) : resolvedPromptLength,
@@ -3794,8 +3798,9 @@ async function processOllamaResponse(response, promptLength) {
                     outputTokens: details.length > 0 ? Math.round(totalOutputTokens / details.length) : 'N/A',
                     outputTimeMs: (decodeDurationSec * 1000).toFixed(2),
                     outputSpeed: totalOutputSpeed.toFixed(2),  // 修复：使用总吞吐而不是平均值
-                    status: t.statusSuccess,
+                    status: statusText,
                     concurrency: message.concurrency,
+                    successful: message.successful,
                     concurrentDetails: concurrentDetailsToSave,
                     promptText: firstPromptSample,  // 始终保存第一个请求的prompt作为示例
                     outputText: firstOutputSample,  // 始终保存第一个请求的output作为示例
@@ -4481,6 +4486,27 @@ async function processOllamaResponse(response, promptLength) {
             alert(translations[currentLang].alertMarkdownCopied);
         });
 
+        function formatCsvStatus(res, fallbackConcurrency = 1) {
+            const t = translations[currentLang];
+            const statusText = String(res?.status || '');
+            if (/\d+\s*\/\s*\d+/.test(statusText)) return statusText;
+
+            const concurrency = Math.max(1, parseInt(res?.concurrency ?? fallbackConcurrency, 10) || 1);
+            const detailCount = Array.isArray(res?.concurrentDetails)
+                ? res.concurrentDetails.length
+                : (Array.isArray(res?.concurrent_details) ? res.concurrent_details.length : 0);
+            const explicitSuccessful = parseInt(res?.successful, 10);
+            let successful = Number.isFinite(explicitSuccessful) ? explicitSuccessful : null;
+            if (successful === null && detailCount > 0) successful = detailCount;
+            if (successful === null && (statusText === t.statusSuccess || statusText.includes('成功') || statusText.includes('Success'))) {
+                successful = concurrency;
+            }
+            if (successful !== null) {
+                return `${Math.max(0, Math.min(concurrency, successful))}/${concurrency} ${t.msgConcurrentSuccess}`;
+            }
+            return statusText || t.statusFailed;
+        }
+
         exportCSVBtn.addEventListener('click', () => {
             const t = translations[currentLang];
             const apiTypeText = currentApiType === 'openai' ? t.apiOpenAI : t.apiOllama;
@@ -4496,7 +4522,8 @@ async function processOllamaResponse(response, promptLength) {
                 const ttft = res.avgTtftMs || 'N/A';
                 const itlMean = res.avgItlMean || 'N/A';
                 const itlStd = res.avgItlStd || 'N/A';
-                csvContent += `${res.promptLength},${ttft},${itlMean},${itlStd},${res.prefillTimeMs},${res.prefillSpeed},${res.outputTokens},${res.outputTimeMs},${res.outputSpeed},"${res.status.replace(/"/g, '""')}"\n`;
+                const status = formatCsvStatus(res, concurrencyValue).replace(/"/g, '""');
+                csvContent += `${res.promptLength},${ttft},${itlMean},${itlStd},${res.prefillTimeMs},${res.prefillSpeed},${res.outputTokens},${res.outputTimeMs},${res.outputSpeed},"${status}"\n`;
             });
             // 使用Blob创建下载，确保BOM生效
             const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8' });
@@ -6235,7 +6262,8 @@ async function processOllamaResponse(response, promptLength) {
                 const ttft = res.avgTtftMs || 'N/A';
                 const itlMean = res.avgItlMean || 'N/A';
                 const itlStd = res.avgItlStd || 'N/A';
-                csvContent += `${res.promptLength},${ttft},${itlMean},${itlStd},${res.prefillTimeMs},${res.prefillSpeed},${res.outputTokens},${res.outputTimeMs},${res.outputSpeed},"${res.status.replace(/"/g, '""')}"\n`;
+                const status = formatCsvStatus(res, record.config.concurrency).replace(/"/g, '""');
+                csvContent += `${res.promptLength},${ttft},${itlMean},${itlStd},${res.prefillTimeMs},${res.prefillSpeed},${res.outputTokens},${res.outputTimeMs},${res.outputSpeed},"${status}"\n`;
             });
 
             // 使用Blob创建下载，确保BOM生效
@@ -7365,19 +7393,32 @@ async function processOllamaResponse(response, promptLength) {
                         }
                         cols.push(curCol);
 
-                        if (cols.length < 9) continue; // 列不够
+                        if (cols.length < 7) continue; // 列不够
 
-                        // 结构: 提示词长度(tokens),TTFT(ms),ITL平均(ms),ITL标准差(ms),预填充耗时(ms),预填充速度(tokens/s),输出长度(tokens),输出耗时(ms),输出速度(tokens/s),状态
-                        const promptLen = parseFloat(cols[0]);
-                        const ttft = parseFloat(cols[1]); // 可能为 NaN (N/A)
-                        const itlMean = parseFloat(cols[2]); // 可能为 NaN
-                        const itlStd = parseFloat(cols[3]); // 可能为 NaN
-                        const prefillTime = parseFloat(cols[4]);
-                        const prefillSpeed = parseFloat(cols[5]);
-                        const outputLen = parseFloat(cols[6]);
-                        const outputTime = parseFloat(cols[7]);
-                        const outputSpeed = parseFloat(cols[8]);
-                        const status = cols[9] || '';
+                        let promptLen, ttft, itlMean, itlStd, prefillTime, prefillSpeed, outputTime, outputSpeed, status;
+                        if (cols.length >= 10) {
+                            // Python backend CSV: prompt, TTFT, ITL mean/std, prefill, output, status.
+                            promptLen = parseFloat(cols[0]);
+                            ttft = parseFloat(cols[1]);
+                            itlMean = parseFloat(cols[2]);
+                            itlStd = parseFloat(cols[3]);
+                            prefillTime = parseFloat(cols[4]);
+                            prefillSpeed = parseFloat(cols[5]);
+                            outputTime = parseFloat(cols[7]);
+                            outputSpeed = parseFloat(cols[8]);
+                            status = cols[9] || '';
+                        } else {
+                            // Standalone browser CSV: prompt, prefill, output, status.
+                            promptLen = parseFloat(cols[0]);
+                            ttft = NaN;
+                            itlMean = NaN;
+                            itlStd = NaN;
+                            prefillTime = parseFloat(cols[1]);
+                            prefillSpeed = parseFloat(cols[2]);
+                            outputTime = parseFloat(cols[4]);
+                            outputSpeed = parseFloat(cols[5]);
+                            status = cols[6] || '';
+                        }
 
                         // 只需要成功的，或者至少有速度的
                         if (isNaN(prefillSpeed) || isNaN(outputSpeed)) continue;

@@ -3616,9 +3616,9 @@
                     Number.isFinite(concurrencyRaw) && concurrencyRaw > 0 ? concurrencyRaw : 0,
                     detailSuccessCount
                 );
-                const successRaw = Number(item?.successful);
                 const hasStoredSuccessful = item?.successful !== undefined && item?.successful !== null && item?.successful !== '';
-                let successful = Number.isFinite(successRaw) ? successRaw : null;
+                const successRaw = hasStoredSuccessful ? Number(item?.successful) : NaN;
+                let successful = hasStoredSuccessful && Number.isFinite(successRaw) ? successRaw : null;
                 if (detailSuccessCount > 0) {
                     successful = Math.max(successful ?? 0, detailSuccessCount);
                 }
@@ -3633,9 +3633,7 @@
                 }
                 successful = Math.max(0, Math.min(pointConcurrency, Math.round(successful)));
                 const successCountIsExact = !inferredLegacySingleSuccess && (detailSuccessCount > 0
-                    || pointConcurrency === 1
-                    || (Number.isFinite(successRaw) && (successRaw === 0 || successRaw > 1 || successRaw === pointConcurrency))
-                    || (!hasStoredSuccessful && pointConcurrency === 1));
+                    || (hasStoredSuccessful && Number.isFinite(successRaw) && (successRaw === 0 || successRaw > 1 || successRaw === pointConcurrency)));
 
                 return {
                     ...item,

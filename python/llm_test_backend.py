@@ -18,7 +18,7 @@ import httpx
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 # ============================================================
 # Supabase 配置（云端结果共享）
@@ -563,9 +563,17 @@ def _hash_password(password: str) -> str:
     return f"pbkdf2${salt.hex()}${dk.hex()}"
 
 
-def _verify_password(password: str, stored: str) -> bool:
-    """验证密码，使用常量时间比较防止时序攻击"""
+def _verify_password(password: str, stored: str, user_code: Optional[str] = None) -> bool:
+    """Verify PBKDF2 hashes and legacy browser SHA-256 hashes."""
     import hmac as _hmac
+    if not stored:
+        return False
+
+    # Standalone browser pages store SHA-256(user_code + ":" + password).
+    if re.fullmatch(r"[0-9a-fA-F]{64}", stored or "") and user_code:
+        expected = hashlib.sha256(f"{user_code.strip()}:{password}".encode("utf-8")).hexdigest()
+        return _hmac.compare_digest(expected.lower(), stored.lower())
+
     try:
         _, salt_hex, hash_hex = stored.split('$')
         salt = bytes.fromhex(salt_hex)
@@ -647,9 +655,10 @@ class RecoverPayload(BaseModel):
 async def recover_user_code(request: Request, payload: RecoverPayload):
     """通过用户名+密码找回识别码。严格速率限制：同 IP 每小时最多 5 次。"""
     # 查询用户名对应记录（含 password_hash）
+    nickname_query = quote(payload.nickname.strip(), safe="")
     resp = await _supabase_request(
         "GET",
-        f"{USER_PROFILES_TABLE}?nickname=eq.{payload.nickname.strip()}&select=user_code,password_hash&limit=1",
+        f"{USER_PROFILES_TABLE}?nickname=ilike.{nickname_query}&select=user_code,password_hash&limit=1",
     )
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail="查询失败")
@@ -661,7 +670,7 @@ async def recover_user_code(request: Request, payload: RecoverPayload):
         # 没有设置密码，无法通过此方式找回
         raise HTTPException(status_code=403, detail="该用户名未设置密码，无法通过此方式找回识别码")
 
-    if not _verify_password(payload.password, stored_hash):
+    if not _verify_password(payload.password, stored_hash, data[0].get("user_code") if data else None):
         raise HTTPException(status_code=403, detail="用户名或密码错误")
 
     return {"user_code": data[0]["user_code"]}
