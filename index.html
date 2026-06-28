@@ -1,6 +1,10 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <!-- 原作者：纸鸢随风（B站）、DeepSeek-R1-0528-->
+<!-- v3.1 (Custom Mod - 2026-06-28 11:57):
+    1. 新增刷新模型列表按钮
+    2. 模型名称支持下拉列表选择与手动输入动态切换
+-->
 <!-- v2.2 (chao魔改版):
     可以在下面的github地址获取最新版的更新
     https://github.com/gengchaogit/llm_speedtest
@@ -1039,6 +1043,36 @@
                 flex-direction: column;
             }
         }
+
+        /* 模型刷新按钮与下拉选择框样式 */
+        .btn-refresh-models {
+            background: #f0f4f8;
+            border: 1px solid #cbd5e1;
+            color: #334155;
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-size: 12px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            transition: all 0.2s;
+        }
+        .btn-refresh-models:hover {
+            background: #e2e8f0;
+            border-color: #94a3b8;
+        }
+        .btn-refresh-models:active {
+            background: #cbd5e1;
+        }
+        .btn-refresh-models.loading .refresh-icon {
+            display: inline-block;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
     </style>
 </head>
 
@@ -1079,9 +1113,19 @@
                     <input type="text" id="apiUrl" value="">
                 </div>
                 <div class="form-group">
-                    <label for="modelName">模型名称</label>
-                    <input type="text" id="modelName" value="" list="modelSuggest" autocomplete="off"
-                        placeholder="输入模型名称，将自动联想...">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                        <label for="modelName" style="margin-bottom: 0;">模型名称</label>
+                        <button type="button" id="btnRefreshModels" class="btn-refresh-models" title="重新获取模型列表" onclick="refreshModelList()">
+                            <span class="refresh-icon">🔄</span> <span id="refreshBtnText">刷新</span>
+                        </button>
+                    </div>
+                    <div class="model-select-wrapper" style="position: relative; display: flex; gap: 6px; align-items: center;">
+                        <select id="modelSelect" style="display: none; flex: 1; height: 38px; border: 1px solid #ccc; border-radius: 4px; padding: 0 10px; font-size: 14px; background-color: #fff; box-sizing: border-box;" onchange="handleModelSelectChange(this)">
+                        </select>
+                        <input type="text" id="modelName" value="" list="modelSuggest" autocomplete="off"
+                            placeholder="输入模型名称，自动匹配..." style="flex: 1; box-sizing: border-box;">
+                        <button type="button" id="btnToggleModelInput" onclick="toggleModelInputMode()" style="display: none; height: 38px; padding: 0 10px; border: 1px solid #ccc; border-radius: 4px; background: #f8f9fa; font-size: 13px; cursor: pointer; white-space: nowrap;" title="切换手动输入/下拉选择">✏️ 手动输入</button>
+                    </div>
                     <datalist id="modelSuggest"></datalist>
                     <p id="modelSuggestStatus" class="model-suggest-status"
                         style="margin-top: 5px; font-size: 12px; color: #666;"></p>
@@ -2539,6 +2583,7 @@
                 } else {
                     setModelSuggestStatusKey(cachedModels.length > 0 ? 'modelSuggestLoaded' : 'modelSuggestEmpty', { count: cachedModels.length });
                 }
+                updateModelSelectDropdown(cachedModels);
                 return cachedModels;
             }
             if (_isFetchingCustomModels) return null;
@@ -2566,6 +2611,7 @@
                 _customModelFetchState[endpoint] = { kind: names.length > 0 ? 'success' : 'empty' };
                 console.log(`[ModelSuggest] 从接口 ${endpoint} 成功拉取 ${names.length} 个模型`);
                 setModelSuggestStatusKey(names.length > 0 ? 'modelSuggestLoaded' : 'modelSuggestEmpty', { count: names.length });
+                updateModelSelectDropdown(names);
                 return names;
             } catch (err) {
                 const friendlyMessage = getFriendlyFetchErrorMessage(err, endpoint);
