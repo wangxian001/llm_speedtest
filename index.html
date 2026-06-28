@@ -2642,6 +2642,22 @@
             return baseUrl + suffix;
         }
 
+        // 实时保存当前配置到 localStorage（每次输入变化时调用）
+        function saveCurrentConfig() {
+            try {
+                const fullUrl = getFullApiUrl();
+                if (fullUrl) localStorage.setItem('llmPerfTestApiUrl', fullUrl);
+                const modelVal = document.getElementById('modelName')?.value?.trim();
+                if (modelVal) localStorage.setItem('llmPerfTestModelName', modelVal);
+                const apiKey = document.getElementById('apiKey')?.value?.trim();
+                if (apiKey !== undefined) localStorage.setItem('llmPerfTestApiKey', apiKey);
+                const apiType = document.querySelector('.api-option.active')?.dataset?.type;
+                if (apiType) localStorage.setItem('llmPerfTestApiType', apiType);
+            } catch (e) {
+                console.warn('[saveCurrentConfig] 保存失败:', e);
+            }
+        }
+
         function syncApiUrlAndRefreshModels(debounce = true) {
             const fullUrl = getFullApiUrl();
             const hiddenApiUrl = document.getElementById('apiUrl');
